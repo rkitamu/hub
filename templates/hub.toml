@@ -1,0 +1,61 @@
+# 環境の herdr の構成。hub-reset はこの通りに herdr を組み立てる。
+# パスはすべて環境（hub-env の親ディレクトリ）からの相対パスで書く。
+
+# 環境を置く herdr のセッション名。hub-reset はこのセッションのペインで実行する。
+session = "hub"
+
+# ── ワークスペース ──────────────────────────────────────────────
+# [[workspace]] を書いた順に、herdr のサイドバーへ並ぶ。
+#   label  ワークスペースの名前。hub-reset <label> で、そのワークスペースだけを作り直せる
+#   cwd    ワークスペースのディレクトリ。タブとペインはここで開く
+#
+# [[workspace.tab]] を書いた順に、タブが並ぶ。
+#   label  タブの名前
+#
+# [[workspace.tab.pane]] を書いた順に、ペインを作る。1 つ目はタブを作ったときからあるペイン。
+#   name   ペインの名前。後のペインの split.from で参照する
+#   split  2 つ目以降のペインの作り方。{ from = "<分割元の name>", direction = "right" | "down", ratio = <分割元に残す割合> }
+#   run    ペインで実行するコマンド。cwd で実行される
+#   agent  ペインで起動するエージェント。{ name = "<herdr 上の名前>", args = [<claude の引数>] }
+#          name は herdr のセッションの中で一意
+
+# hub-env は司令塔のワークスペース。どの環境でもこのまま使える。
+[[workspace]]
+label = "hub-env"
+cwd = "hub-env"
+
+[[workspace.tab]]
+label = "Claude"
+
+[[workspace.tab.pane]]
+name = "claude"
+agent = { name = "hub" }
+
+[[workspace.tab]]
+label = "Shell"
+
+# ── 例: 子リポジトリのワークスペース ─────────────────────────────
+# 以下は、作者の手元の todo リポジトリ（scripts/todo-view などを持つ）を前提にした例。
+# このままでは動かないので、自分の子リポジトリに合わせて書き換え、コメントを外して使う。
+# 子リポジトリごとに [[workspace]] を 1 つ足す。要らなければ消してよい。
+#
+# [[workspace]]
+# label = "todo"
+# cwd = "todo"
+#
+# [[workspace.tab]]
+# label = "ToDo"
+#
+# [[workspace.tab.pane]]
+# name = "view"
+# run = "scripts/todo-view data/active.md"
+#
+# [[workspace.tab.pane]]
+# name = "claude"
+# split = { from = "view", direction = "right", ratio = 0.55 }
+# agent = { name = "todo", args = ["--agent", "todo"] }
+#
+# [[workspace.tab.pane]]
+# name = "notes"
+# split = { from = "view", direction = "down", ratio = 0.43 }
+# run = "scripts/todo-notes data/notes"

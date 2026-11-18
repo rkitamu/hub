@@ -1,0 +1,258 @@
+#!/usr/bin/env -S uv run --quiet --script
+# /// script
+# requires-python = ">=3.11"
+# dependencies = []
+# ///
+"""hub.toml の通りに、herdr の環境を組み立て直す。
+
+usage:
+  hub-reset            ワークスペースを全部閉じて、hub.toml の順に作り直す
+  hub-reset <label>…   指定したワークスペースだけを作り直す
+
+herdr のペインの中で実行する。環境は、HERDR_SESSION を session に書いた ~/.config/hub/envs の環境。
+"""
+
+from __future__ import annotations
+
+import json
+import os
+import shlex
+import subprocess
+import sys
+import time
+import tomllib
+from pathlib import Path
+
+ENVS_FILE = Path(os.environ.get("XDG_CONFIG_HOME") or Path.home() / ".config") / "hub/envs"
+LOG = Path(os.environ.get("XDG_STATE_HOME") or Path.home() / ".local/state") / "hub-reset.log"
+
+ENV_DIR: Path  # main() で決める
+
+
+class ResetError(Exception):
+    pass
+
+
+def herdr(*args: str, check: bool = True) -> dict:
+    p = subprocess.run(["herdr", *args], capture_output=True, text=True)
+    try:
+        out = json.loads(p.stdout) if p.stdout.strip() else {}
+    except json.JSONDecodeError:
+        out = {}
+    if check and (p.returncode != 0 or "error" in out):
+        msg = out.get("error", {}).get("message") or p.stderr.strip() or p.stdout.strip()
+        raise ResetError(f"herdr {' '.join(args)}: {msg}")
+    return out
+
+
+# ── 環境 ───────────────────────────────────────────────────────
+
+
+def registered_envs() -> list[Path]:
+    if not ENVS_FILE.exists():
+        return []
+    return [Path(l) for l in ENVS_FILE.read_text().split() if l]
+
+
+def read_config(env: Path) -> dict | None:
+    try:
+        return tomllib.loads((env / "hub-env/hub.toml").read_text())
+    except (OSError, tomllib.TOMLDecodeError):
+        return None
+
+
+def find_env() -> tuple[Path, dict]:
+    session = os.environ.get("HERDR_SESSION")
+    if not session:
+        raise ResetError("HERDR_SESSION がありません。hub.toml の session に書いたセッションのペインで実行してください")
+    hits = [(e, c) for e in registered_envs() if (c := read_config(e)) and c.get("session") == session]
+    if len(hits) != 1:
+        raise ResetError(f"session '{session}' の環境が {len(hits)} 個あります（{ENVS_FILE}）")
+    return hits[0]
+
+
+# ── 設定 ───────────────────────────────────────────────────────
+
+
+def check_config(cfg: dict) -> None:
+    """herdr を操作する前に、途中で止まる書き間違いを見つける。"""
+    wss = cfg.get("workspace") or []
+    if not wss:
+        raise ResetError("hub.toml に [[workspace]] がありません")
+    for ws in wss:
+        if not ws.get("label") or not ws.get("cwd"):
+            raise ResetError(f"[[workspace]] に label か cwd がありません: {ws}")
+        ws["_cwd"] = (ENV_DIR / ws["cwd"]).resolve()
+        if not ws["_cwd"].is_dir():
+            raise ResetError(f"ワークスペース {ws['label']} の cwd がありません: {ws['_cwd']}")
+        ws.setdefault("tab", [{"label": ws["label"]}])
+        for tab in ws["tab"]:
+            if not tab.get("label"):
+                raise ResetError(f"ワークスペース {ws['label']} に label の無いタブがあります")
+            names: list[str] = []
+            for i, pane in enumerate(tab.get("pane", [])):
+                if i and pane.get("split", {}).get("from") not in names:
+                    raise ResetError(f"タブ {tab['label']} の {i + 1} 番目のペイン: split.from が前のペインの name ではありません")
+                if "agent" in pane and not pane["agent"].get("name"):
+                    raise ResetError(f"タブ {tab['label']} の {i + 1} 番目のペイン: agent に name がありません")
+                names.append(pane.get("name", f"pane{i}"))
+
+
+# ── 組み立て ───────────────────────────────────────────────────
+
+
+def build_tab(tab: dict, root_pane: str, cwd: Path, agents: list) -> None:
+    """タブのペインを分割してコマンドを実行する。エージェントは agents に積んで、後で起動する。"""
+    panes = tab.get("pane") or [{}]
+    ids: dict[str, str] = {}
+    for i, pane in enumerate(panes):
+        name = pane.get("name", f"pane{i}")
+        if i == 0:
+            pid = root_pane
+        else:
+            sp = pane["split"]
+            pid = herdr("pane", "split", ids[sp["from"]], "--direction", sp.get("direction", "right"),
+                        "--ratio", str(sp.get("ratio", 0.5)), "--cwd", str(cwd), "--no-focus")["result"]["pane"]["pane_id"]
+        ids[name] = pid
+        if pane.get("run"):
+            herdr("pane", "run", pid, f"cd {shlex.quote(str(cwd))} && {pane['run']}")
+        if pane.get("agent"):
+            agents.append((pid, pane["agent"]))
+
+
+def add_tabs(ws_id: str, ws: dict, agents: list, first_tab: tuple[str, str] | None = None) -> list[str]:
+    """ワークスペースに hub.toml のタブを順に作る。first_tab = (tab_id, root_pane) があれば 1 つ目に使う。"""
+    tab_ids = []
+    for i, tab in enumerate(ws["tab"]):
+        if i == 0 and first_tab:
+            tab_id, root = first_tab
+            herdr("tab", "rename", tab_id, tab["label"])
+        else:
+            res = herdr("tab", "create", "--workspace", ws_id, "--cwd", str(ws["_cwd"]),
+                        "--label", tab["label"], "--no-focus")["result"]
+            tab_id, root = res["tab"]["tab_id"], res["root_pane"]["pane_id"]
+        build_tab(tab, root, ws["_cwd"], agents)
+        tab_ids.append(tab_id)
+    return tab_ids
+
+
+def create_workspace(ws: dict, agents: list) -> tuple[str, list[str]]:
+    res = herdr("workspace", "create", "--cwd", str(ws["_cwd"]), "--label", ws["label"], "--no-focus")["result"]
+    ws_id = res["workspace"]["workspace_id"]
+    tabs = add_tabs(ws_id, ws, agents, (res["tab"]["tab_id"], res["root_pane"]["pane_id"]))
+    return ws_id, tabs
+
+
+def start_agents(agents: list) -> None:
+    for pane, ag in agents:
+        name = ag["name"]
+        cmd = ["agent", "start", name, "--kind", ag.get("kind", "claude"), "--pane", pane]
+        if ag.get("args"):
+            cmd += ["--", *ag["args"]]
+        for _ in range(10):
+            if subprocess.run(["herdr", *cmd], capture_output=True).returncode == 0:
+                break
+            # 起動はしたが確認ダイアログ（初回のフォルダ信頼など）で止まっている場合は、ユーザーに任せる
+            st = herdr("agent", "get", name, check=False).get("result", {}).get("agent", {})
+            if st.get("pane_id") == pane and st.get("agent_status") == "blocked":
+                print(f"note: {name} が確認待ちです（初回のフォルダ信頼など）。そのタブで答えてください", file=sys.stderr)
+                break
+            time.sleep(1)
+        else:
+            print(f"warning: エージェント {name} の起動に失敗しました（pane {pane}）", file=sys.stderr)
+
+
+def workspaces() -> list[dict]:
+    return herdr("workspace", "list")["result"]["workspaces"]
+
+
+def reset_all(cfg: dict) -> None:
+    wss = cfg["workspace"]
+    agents: list = []
+    # 1. 1 つ目のワークスペースを先に作る（ワークスペースが 0 個になる瞬間を作らないため）
+    first_id, first_tabs = create_workspace(wss[0], agents)
+    # 2. それ以外を全部閉じる（古いエージェントの名前もここで空く）
+    for w in workspaces():
+        if w["workspace_id"] != first_id:
+            herdr("workspace", "close", w["workspace_id"])
+            print(f"ワークスペースを閉じました: {w['label']} ({w['workspace_id']})")
+    start_agents(agents)
+    print(f"{wss[0]['label']} を作りました")
+    # 3. 残りを hub.toml の順に作る（作った順にサイドバーへ並ぶ）
+    for ws in wss[1:]:
+        agents = []
+        create_workspace(ws, agents)
+        start_agents(agents)
+        print(f"{ws['label']} を作りました")
+    herdr("workspace", "focus", first_id, check=False)
+    herdr("tab", "focus", first_tabs[0], check=False)
+
+
+def reset_some(cfg: dict, labels: list[str]) -> None:
+    by_label = {ws["label"]: ws for ws in cfg["workspace"]}
+    for label in labels:
+        ws = by_label[label]
+        existing = [w for w in workspaces() if w["label"] == label]
+        agents: list = []
+        if not existing:
+            create_workspace(ws, agents)
+        else:
+            # 既存のワークスペースの中で、新しいタブを作ってから古いタブを閉じる（並び順を保つため）
+            ws_id = existing[0]["workspace_id"]
+            old_tabs = [t["tab_id"] for t in herdr("tab", "list", "--workspace", ws_id)["result"]["tabs"]]
+            add_tabs(ws_id, ws, agents)
+            for t in old_tabs:
+                herdr("tab", "close", t)
+        start_agents(agents)
+        print(f"{label} を作り直しました")
+
+
+# ── 入口 ───────────────────────────────────────────────────────
+
+
+def own_workspace_label() -> str | None:
+    wid = os.environ.get("HERDR_WORKSPACE_ID")
+    if not wid:
+        return None
+    return herdr("workspace", "get", wid, check=False).get("result", {}).get("workspace", {}).get("label")
+
+
+def main() -> int:
+    global ENV_DIR
+    if any(a in ("-h", "--help") for a in sys.argv[1:]):
+        print(__doc__.strip())
+        return 0
+    try:
+        labels = sys.argv[1:]
+        bad = [a for a in labels if a.startswith("-")]
+        if bad:
+            raise ResetError(f"知らないオプションです: {bad[0]}")
+        ENV_DIR, cfg = find_env()
+        check_config(cfg)
+        unknown = [l for l in labels if l not in {ws["label"] for ws in cfg["workspace"]}]
+        if unknown:
+            raise ResetError(f"hub.toml に無いワークスペースです: {', '.join(unknown)}")
+
+        # 自分のいるワークスペースも閉じるなら、端末から切り離して続ける
+        if os.environ.get("HERDR_WORKSPACE_ID") and not os.environ.get("HUB_RESET_DETACHED"):
+            if not labels or own_workspace_label() in labels:
+                LOG.parent.mkdir(parents=True, exist_ok=True)
+                with open(LOG, "w") as log:
+                    subprocess.Popen([sys.argv[0], *labels], stdin=subprocess.DEVNULL, stdout=log,
+                                     stderr=subprocess.STDOUT, start_new_session=True,
+                                     env={**os.environ, "HUB_RESET_DETACHED": "1"})
+                print(f"このタブも閉じられるので、裏で立て直します。経過: {LOG}")
+                return 0
+
+        if labels:
+            reset_some(cfg, labels)
+        else:
+            reset_all(cfg)
+        return 0
+    except ResetError as e:
+        print(f"error: {e}", file=sys.stderr)
+        return 1
+
+
+if __name__ == "__main__":
+    sys.exit(main())
