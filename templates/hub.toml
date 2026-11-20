@@ -7,7 +7,7 @@ session = "hub"
 # ── ワークスペース ──────────────────────────────────────────────
 # [[workspace]] を書いた順に、herdr のサイドバーへ並ぶ。
 #   label  ワークスペースの名前。hub-reset <label> で、そのワークスペースだけを作り直せる
-#   cwd    ワークスペースのディレクトリ。タブとペインはここで開く
+#   cwd    ワークスペースのディレクトリ。ペインは、ペインの cwd を書かなければここで開く
 #
 # [[workspace.tab]] を書いた順に、タブが並ぶ。
 #   label  タブの名前
@@ -15,7 +15,8 @@ session = "hub"
 # [[workspace.tab.pane]] を書いた順に、ペインを作る。1 つ目はタブを作ったときからあるペイン。
 #   name   ペインの名前。後のペインの split.from で参照する
 #   split  2 つ目以降のペインの作り方。{ from = "<分割元の name>", direction = "right" | "down", ratio = <分割元に残す割合> }
-#   run    ペインで実行するコマンド。cwd で実行される
+#   cwd    ペインを開くディレクトリ（省略可）。省略するとワークスペースの cwd。1 つ目のペインにも効く
+#   run    ペインで実行するコマンド。ペインの cwd で実行される
 #   agent  ペインで起動するエージェント。{ name = "<herdr 上の名前>", args = [<claude の引数>] }
 #          name は herdr のセッションの中で一意
 
@@ -58,4 +59,5 @@ label = "Shell"
 # [[workspace.tab.pane]]
 # name = "notes"
 # split = { from = "view", direction = "down", ratio = 0.43 }
-# run = "scripts/todo-notes data/notes"
+# cwd = "todo/data/notes"
+# run = "../../scripts/todo-notes"

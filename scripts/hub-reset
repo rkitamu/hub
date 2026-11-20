@@ -95,20 +95,30 @@ def check_config(cfg: dict) -> None:
                     raise ResetError(f"タブ {tab['label']} の {i + 1} 番目のペイン: split.from が前のペインの name ではありません")
                 if "agent" in pane and not pane["agent"].get("name"):
                     raise ResetError(f"タブ {tab['label']} の {i + 1} 番目のペイン: agent に name がありません")
+                pane["_cwd"] = (ENV_DIR / pane["cwd"]).resolve() if pane.get("cwd") else ws["_cwd"]
+                if not pane["_cwd"].is_dir():
+                    raise ResetError(f"タブ {tab['label']} の {i + 1} 番目のペイン: cwd がありません: {pane['_cwd']}")
                 names.append(pane.get("name", f"pane{i}"))
 
 
 # ── 組み立て ───────────────────────────────────────────────────
 
 
-def build_tab(tab: dict, root_pane: str, cwd: Path, agents: list) -> None:
-    """タブのペインを分割してコマンドを実行する。エージェントは agents に積んで、後で起動する。"""
+def build_tab(tab: dict, root_pane: str, root_cwd: Path, agents: list) -> None:
+    """タブのペインを分割してコマンドを実行する。エージェントは agents に積んで、後で起動する。
+
+    root_cwd は、タブを作ったときからあるペイン（root_pane）が開いているディレクトリ。
+    """
     panes = tab.get("pane") or [{}]
     ids: dict[str, str] = {}
     for i, pane in enumerate(panes):
         name = pane.get("name", f"pane{i}")
+        cwd = pane.get("_cwd", root_cwd)
         if i == 0:
             pid = root_pane
+            # 最初のペインはワークスペースの cwd で開いているので、別の cwd なら移る
+            if cwd != root_cwd and not pane.get("run"):
+                herdr("pane", "run", pid, f"cd {shlex.quote(str(cwd))}")
         else:
             sp = pane["split"]
             pid = herdr("pane", "split", ids[sp["from"]], "--direction", sp.get("direction", "right"),
