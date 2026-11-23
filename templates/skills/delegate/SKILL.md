@@ -1,0 +1,40 @@
+---
+name: delegate
+description: TODO の作業をエージェントに任せる段取り。ユーザーが「#30 を任せて」「30 をやっておいて」のように TODO の委任を頼んだときに使う。
+---
+
+# TODO の作業を任せる
+
+司令塔は段取りだけを行い、作業そのものはしない。TODO のデータは読むだけで、書き換えは todo エージェントに頼む。
+
+## 手順
+
+1. **TODO を読む。** `hub.toml` の `todo_file`（既定は `todo/data/active.md`）の該当行と、同じ場所の `notes/<id>-*.md` を読む。id が見つからなければ、ユーザーに聞き直す。
+2. **作業を組み立てる。** 対象のリポジトリ、worktree の要否、依頼文、完了の条件を決める。作業名は英小文字・数字・ハイフンの 20 文字以内で提案する。`archive` と既存の作業名（`hub-work list --all`）は使えない。
+3. **ユーザーに確認する。** 作業名・リポジトリ・worktree の要否・依頼内容・壊れうる操作の有無を示し、OK をもらう。OK の前に `hub-work start` を実行しない。
+4. **始める。**
+
+   ```sh
+   hub-work start <作業名> --repo <環境からの相対パス> --todo <id> [--worktree] \
+     --purpose "<目的>" --request "<依頼文>"
+   ```
+
+   `--request` を付けると、status.md の場所と報告の決まりを添えてエージェントに依頼が届く。
+5. **報告を待つ。** 通知が来たら、まず `<work_dir>/<作業名>/status.md` を読む。
+6. **締める。** 結果をユーザーに伝え、OK をもらってから `hub-work finish <作業名>` を実行する。TODO の記録は todo エージェントに頼む。ユーザーの指摘のうち今後も効くものは、`commander.md` の「レビューの記録」に沿って振り分ける。
+
+## 作業ディレクトリの使い方
+
+依頼文には次を必ず含める（`--request` を使えば `hub-work` が添える）。
+
+- 消えて困るものは作業コピー（worktree）に置かない。`finish` で ignore 対象ごと削除される。
+- メモ（手順・調査メモ・再現方法）は `<work_dir>/<作業名>/runbook.md`、検証データは `<work_dir>/<作業名>/data/` に置く。
+- 秘密情報は `runbook.md` にも `data/` にも書かない。
+- 作業エージェントが書き込めるのは、その作業のディレクトリだけ。他の作業のディレクトリには書かない。
+
+## 作業エージェントの報告の決まり
+
+1. 先に status.md の本文（進捗・結果）へ書く。止まったら front matter の `state` を `blocked` にする。
+2. そのあと `herdr agent prompt hub "<作業名と要約>"` で通知する。
+3. `agent_blocked` などで拒否されたら、少し待って再送する。
+4. `timeout` は届いた可能性があるので、`herdr agent read hub --source recent-unwrapped --lines 40` で確かめてから再送する。
