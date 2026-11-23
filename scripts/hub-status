@@ -1,0 +1,100 @@
+#!/usr/bin/env -S uv run --quiet --script
+# /// script
+# requires-python = ">=3.11"
+# dependencies = []
+# ///
+"""エージェントの状態、各リポジトリの未コミット変更、進行中の作業、期限の近い TODO を一覧する。何も変更しない。
+
+usage: hub-status [--days <日数>]   期限の近い TODO の範囲（既定 7 日。期限切れも出す）
+"""
+
+from __future__ import annotations
+
+import argparse
+import re
+import sys
+from datetime import date, datetime, timedelta
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "lib"))
+from hublib import (HubError, dirty_files, find_env, is_git_repo, live_agents, read_status,  # noqa: E402
+                    todo_file, work_dir)
+
+
+def repo_dirs(env: Path, cfg: dict) -> list[Path]:
+    dirs = {p.resolve() for p in env.iterdir() if p.is_dir() and not p.name.startswith(".") and is_git_repo(p)}
+    dirs |= {(env / ws["cwd"]).resolve() for ws in cfg.get("workspace", []) if ws.get("cwd")}
+    return sorted(d for d in dirs if d.is_dir() and is_git_repo(d))
+
+
+def due_todos(path: Path, today: date, days: int) -> list[tuple[date, str, str]]:
+    if not path.is_file():
+        return []
+    out = []
+    for line in path.read_text().splitlines():
+        cells = [c.strip() for c in line.strip().strip("|").split("|")]
+        if len(cells) != 6 or not re.fullmatch(r"\d+", cells[0]):
+            continue
+        try:
+            due = datetime.fromisoformat(cells[4]).date()
+        except ValueError:
+            continue
+        if due <= today + timedelta(days=days):
+            out.append((due, cells[0], cells[2]))
+    return sorted(out)
+
+
+def main() -> int:
+    p = argparse.ArgumentParser(prog="hub-status", description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    p.add_argument("--days", type=int, default=7)
+    a = p.parse_args()
+    try:
+        env, cfg = find_env()
+        print("## エージェント")
+        agents = [x for x in live_agents() if x.get("name")]
+        for x in sorted(agents, key=lambda x: x["name"]):
+            print(f"{x['name']}\t{x.get('agent_status')}\t{x.get('cwd')}")
+        if not agents:
+            print("（なし）")
+
+        print("\n## 未コミットの変更")
+        clean = True
+        for d in repo_dirs(env, cfg):
+            if files := dirty_files(d):
+                clean = False
+                print(f"{d.name}\t{len(files)} 件")
+        if clean:
+            print("（なし）")
+
+        print("\n## 進行中の作業")
+        wd = work_dir(env)
+        found = False
+        if wd.is_dir():
+            for f in sorted(wd.glob("*/status.md")):
+                if f.parent.name == "archive":
+                    continue
+                found = True
+                try:
+                    meta, _ = read_status(f)
+                    print(f"{f.parent.name}\t{meta['state']}\ttodo={meta['todo'] or '-'}\t{','.join(meta['repos'])}")
+                except (OSError, HubError) as e:
+                    print(f"{f.parent.name}\terror\t{e}")
+        if not found:
+            print("（なし）")
+
+        print(f"\n## 期限の近い TODO（{a.days} 日以内・期限切れ）")
+        today = date.today()
+        todos = due_todos(todo_file(env, cfg), today, a.days)
+        for due, tid, name in todos:
+            mark = "期限切れ " if due < today else ""
+            print(f"{due}\t#{tid}\t{mark}{name}")
+        if not todos:
+            print("（なし）")
+        return 0
+    except HubError as e:
+        print(f"error: {e}", file=sys.stderr)
+        return 1
+
+
+if __name__ == "__main__":
+    sys.exit(main())

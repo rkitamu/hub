@@ -1,0 +1,143 @@
+#!/usr/bin/env -S uv run --quiet --script
+# /// script
+# requires-python = ">=3.11"
+# dependencies = []
+# ///
+"""MAP.md・hub.toml・実際のリポジトリ・エージェントのずれを検査する。何も変更しない。
+
+usage: hub-check
+
+ずれがあれば一覧して exit 1。hub.toml の session に書いたセッションのペインで実行する。
+setup のワークスペースが起動するエージェントは、hub.toml の agents = ["<名前>"] で宣言すると照合できる。
+"""
+
+from __future__ import annotations
+
+import re
+import sys
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "lib"))
+from hublib import HubError, find_env, is_git_repo, live_agents, read_status, work_dir, workspaces  # noqa: E402
+
+PLANNED = ("未作成", "構想")
+
+
+def map_table(text: str, heading: str) -> list[list[str]]:
+    """見出しの下の表の行を返す。HTML コメントの中は読まない。"""
+    text = re.sub(r"<!--.*?-->", "", text, flags=re.S)
+    m = re.search(rf"^## {re.escape(heading)}\n(.*?)(?=^## |\Z)", text, re.S | re.M)
+    if not m:
+        return []
+    rows = [[c.strip() for c in l.strip().strip("|").split("|")] for l in m.group(1).splitlines() if l.startswith("|")]
+    return [r for r in rows[1:] if not all(set(c) <= {"-", ":"} for c in r)]
+
+
+def name_of(cell: str) -> str:
+    return cell.strip().strip("`")
+
+
+def toml_agents(cfg: dict) -> set[str]:
+    names = set()
+    for ws in cfg.get("workspace", []):
+        names.update(ws.get("agents", []))
+        for tab in ws.get("tab", []):
+            for pane in tab.get("pane", []):
+                if pane.get("agent", {}).get("name"):
+                    names.add(pane["agent"]["name"])
+    return names
+
+
+def work_records(wd: Path) -> tuple[set[str], set[str]]:
+    agents: set[str] = set()
+    labels: set[str] = set()
+    if wd.is_dir():
+        for f in wd.glob("*/status.md"):
+            if f.parent.name == "archive":
+                continue
+            try:
+                meta, _ = read_status(f)
+            except (OSError, HubError):
+                continue
+            agents.update(x["name"] for x in meta["agents"])
+            labels.update({meta["workspace"], *(x["workspace"] for x in meta["agents"])})
+    return agents, labels
+
+
+def check(env: Path, cfg: dict) -> list[str]:
+    out: list[str] = []
+    map_path = env / "hub-env/MAP.md"
+    if not map_path.is_file():
+        return [f"MAP.md がありません: {map_path}"]
+    text = map_path.read_text()
+
+    # リポジトリ
+    repos = {name_of(r[0]): r[1] if len(r) > 1 else "" for r in map_table(text, "リポジトリ") if r}
+    toml_dirs = {}
+    for ws in cfg.get("workspace", []):
+        d = (env / ws.get("cwd", "")).resolve()
+        toml_dirs[d.name] = d
+        if not d.is_dir():
+            out.append(f"hub.toml: ワークスペース {ws.get('label')} の cwd がありません: {d}")
+        if ws.get("setup") and not (env / ws["setup"]).is_file():
+            out.append(f"hub.toml: ワークスペース {ws.get('label')} の setup がありません: {env / ws['setup']}")
+    actual = {p.name for p in env.iterdir() if p.is_dir() and not p.name.startswith(".") and is_git_repo(p)}
+    for name, state in repos.items():
+        exists = name in actual or (name in toml_dirs and toml_dirs[name].is_dir())
+        planned = any(s in state for s in PLANNED)
+        if not exists and not planned:
+            out.append(f"MAP.md: {name} は「{state}」ですが、リポジトリがありません")
+        if exists and planned:
+            out.append(f"MAP.md: {name} は「{state}」ですが、リポジトリがあります")
+    for name in sorted(actual - set(repos)):
+        out.append(f"MAP.md: リポジトリ {name} が載っていません")
+    for name, d in toml_dirs.items():
+        if name not in repos:
+            out.append(f"MAP.md: hub.toml のワークスペースのディレクトリ {name} が載っていません")
+
+    # エージェント
+    in_map = {name_of(r[0]) for r in map_table(text, "herdr 上のエージェント") if r}
+    in_toml = toml_agents(cfg)
+    for name in sorted(in_map - in_toml):
+        out.append(f"エージェント {name}: MAP.md にありますが hub.toml にありません")
+    for name in sorted(in_toml - in_map):
+        out.append(f"エージェント {name}: hub.toml にありますが MAP.md にありません")
+
+    work_agents, work_labels = work_records(work_dir(env))
+    live = {a.get("name") for a in live_agents() if a.get("name")}
+    for name in sorted(in_toml - live):
+        out.append(f"エージェント {name}: hub.toml にありますが動いていません")
+    for name in sorted(live - in_toml - in_map - work_agents):
+        out.append(f"エージェント {name}: 動いていますが、MAP.md にも hub.toml にも作業にもありません")
+    for name in sorted(work_agents - live):
+        out.append(f"エージェント {name}: 進行中の作業に記録がありますが動いていません（hub-work resume）")
+
+    # ワークスペース
+    known = {ws.get("label") for ws in cfg.get("workspace", [])} | work_labels
+    for w in workspaces():
+        if w["label"] not in known:
+            out.append(f"ワークスペース {w['label']}: hub.toml にも作業にもありません")
+    return out
+
+
+def main() -> int:
+    if any(a in ("-h", "--help") for a in sys.argv[1:]):
+        print(__doc__.strip())
+        return 0
+    try:
+        env, cfg = find_env()
+        problems = check(env, cfg)
+    except HubError as e:
+        print(f"error: {e}", file=sys.stderr)
+        return 2
+    if not problems:
+        print("ずれはありません")
+        return 0
+    for p in problems:
+        print(f"- {p}")
+    print(f"{len(problems)} 件のずれがあります")
+    return 1
+
+
+if __name__ == "__main__":
+    sys.exit(main())

@@ -29,7 +29,14 @@ git clone <hub> ~/src/hub
 ~/src/hub/install.sh
 ```
 
-`hub-reset` が `~/.local/bin` にリンクされる。
+次のコマンドが `~/.local/bin` にリンクされる。
+
+- `hub-reset`
+- `hub-work`
+- `hub-status`
+- `hub-check`
+- `hub-guard`
+- `hub-commit-guard`
 
 ### 2. 環境を用意する
 
@@ -58,21 +65,117 @@ hub-reset
 
 ## hub-env
 
+司令塔への頼み方は、各環境の `hub-env/README.md` を参照する。
+
 | ファイル | 中身 |
 |---|---|
 | `CLAUDE.md` | hub の `commander.md`（司令塔の共通ルール）と `MAP.md` を読み込む |
 | `MAP.md` | 地図。子リポジトリとエージェント、子同士の連携ルール |
 | `hub.toml` | herdr のセッション名と、ワークスペース・タブ・ペインの構成。書き方は雛形のコメントにある |
-| `.claude/settings.local.json` | 司令塔の Claude Code の設定。環境と hub を読む許可 |
+| `README.md` | この環境の司令塔への頼み方の表 |
+| `.claude/settings.local.json` | 司令塔の Claude Code の設定。環境と hub を読む許可と、`hub-guard` フック |
+| `.claude/skills/delegate/` | TODO の作業を任せる段取りのスキル |
+| `.gitignore` | `work/` を hub-env の git から外す |
+| `work/` | 作業文書。hub-env とは別の、手元専用の git リポジトリ |
+| `rules/*.md` | この環境のエージェント全員に渡すルール（任意） |
+| `agent-settings.json` | この環境のエージェント全員に `--settings` で渡す設定（任意）。雛形は `hub-commit-guard` を登録する |
+
+`install.sh --env` は既にあるファイルを上書きしない。既存の環境に足すときは、`settings.local.json` の `hooks` と `.gitignore` を手で足す（`agent-settings.json`、`README.md`、スキルは、無ければ作られる）。
 
 ## コマンド
 
 ```sh
 hub-reset         # ワークスペースを全部閉じて、hub.toml の通りに作り直す
 hub-reset todo    # todo ワークスペース（hub.toml の label）だけを作り直す
+
+hub-work start <作業名> --repo <repo> [--todo <id>] [--worktree] [--purpose <目的>] [--request <依頼文>]
+hub-work finish <作業名>   # 記録されたものだけを閉じ、archive へ移す
+hub-work resume <作業名>   # hub-reset の後などに、status.md から立て直す
+hub-work list [--all]
+
+hub-status [--days 7]      # エージェント・未コミット・進行中の作業・期限の近い TODO
+hub-check                  # MAP.md・hub.toml・リポジトリ・エージェントのずれを検査（ずれがあれば exit 1）
 ```
 
 `hub.toml` の `session` に書いたセッションのペインで実行する。
+
+### 作業（hub-work）
+
+作業ごとに `<hub-env>/work/<作業名>/status.md` を作る。
+
+```markdown
+---
+state: active
+todo: 30
+repos: ["todo"]
+workspace: "w-example"
+agents: [{"name": "w-example", "repo": "todo", "cwd": "...", "workspace": "w-example", "kind": "claude"}]
+worktrees: []
+---
+
+# example
+
+## 目的
+
+## 進捗
+
+## 結果
+```
+
+作業ディレクトリには、`status.md`（必須）のほかに `runbook.md`（任意。手順・調査メモ・再現方法）と `data/`（任意。検証データ）を置ける。`start` が作るのは `status.md` だけで、`finish` はディレクトリごと `archive/` へ移す。`status.md` と `runbook.md` は自動でコミットされ、`data/` は work の `.gitignore` で除外される（archive 内も同じ。既存のリポジトリにも次の `hub-work` で効く）。秘密情報はどちらにも書かない。
+
+作業エージェントには起動時に `--add-dir` と `--allowedTools` で、その作業のディレクトリへの書き込みだけを許可する。
+
+- `state` は `active` / `blocked` / `done`。front matter の値は JSON で書く（YAML としても読める）。
+- `--worktree` を付けると、`<環境>/.hub-worktrees/<作業名>/<repo>` にブランチ `work/<作業名>` の worktree を作る。herdr の worktree は 1 つが 1 ワークスペースなので、複数リポジトリでは 2 つ目以降が `w-<作業名>--<repo>` になる。
+- `finish` は worktree に未コミットの変更があれば、何も閉じずに止まる。ブランチは消さない。`.gitignore` された未追跡ファイルは未コミットの変更に数えず、worktree と一緒に消える。
+- 作業のワークスペースが他の worktree の親になっているときも、他の作業を巻き込まないよう止まる。
+- `archive` は作業名に使えない。`archive/` にある名前も再利用できない。
+
+### setup（スクリプトで組み立てるワークスペース）
+
+```toml
+[[workspace]]
+label = "todo"
+cwd = "todo"
+setup = "todo/contrib/herdr/todo-herdr"
+agents = ["todo"]
+```
+
+`hub-reset` は既存のワークスペースを閉じてからスクリプトを実行する。そのため `setup` のワークスペースを単体でリセットすると、サイドバーの末尾へ移る。
+
+### rules と agent-settings.json
+
+`hub-reset` と `hub-work` が起動する claude に、次を渡す。agent の `args` とは併用できる（`--settings` と `--append-system-prompt-file` を `args` に書くと衝突として止まる）。
+
+- `--append-system-prompt-file`: `<hub-env>/rules/*.md` を連結した生成ファイル（rules が無ければ渡さない）。`$XDG_STATE_HOME/hub/envs/<環境>-<ハッシュ>/agent-rules.md` に置く
+- `--settings`: `<hub-env>/agent-settings.json`（あれば）
+
+反映されるのは、次に起動したエージェントから。`setup` のスクリプトが自分で起動するエージェントには自動では届かないので、スクリプト側で環境変数 `HUB_CLAUDE_ARGS`（シェル用に引用済み）を claude の引数に足す。
+
+### hub-commit-guard（main / master へのコミットを拒否するフック）
+
+Bash のコマンドを解析し、main / master への `git commit` を拒否する。`git -C`・`--git-dir`・`GIT_DIR=`・`cd`・複合コマンド・サブシェル・`$(...)`・`bash -c`・`eval`・`env` / `sudo` / `xargs` / `find -exec`・git のエイリアスを辿る。`git switch -c x && git commit` は切り替え先で判定する。スクリプトファイルの中身と、実行時に組み立てられる文字列は辿らない。判定できないときは拒否する。
+
+`--allow <パス>` で、指定したリポジトリを対象から除外できる。これは誤操作の防止であり、セキュリティの境界ではない。
+
+ブランチ運用の方針は、各環境の `hub-env/rules/commit.md` と `agent-settings.json` の責務とする。
+
+### hub-guard（子リポジトリの編集を拒否するフック）
+
+司令塔の Edit / Write / NotebookEdit について、`..` とシンボリックリンクを解決した実際の書き込み先が hub-env の外なら拒否する。判定できないときも拒否する。
+
+**Bash 経由の書き込みは対象外。** `echo > ../todo/x` のような操作は止められないので、これは誤操作の防止であり、セキュリティの境界ではない。
+
+## テスト
+
+```sh
+python3 tests/test_hub_guard.py          # hub-guard の単体テスト
+python3 tests/test_hub_commit_guard.py   # hub-commit-guard の単体テスト
+tests/integration.sh              # 一時ディレクトリの環境と専用の herdr サーバーで通しのテスト
+```
+
+`integration.sh` は `XDG_CONFIG_HOME` ごと一時ディレクトリへ移して専用サーバーを立て、実際のセッションには触らない。
 
 ## ライセンス
 

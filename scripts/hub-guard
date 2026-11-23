@@ -1,0 +1,66 @@
+#!/usr/bin/env python3
+"""司令塔の Edit / Write / NotebookEdit が hub-env の外へ書くのを拒否する PreToolUse フック。
+
+usage: hub-guard --root <hub-env>
+
+判定は、シンボリックリンクと .. を解決した実際の書き込み先で行う。相対パスは入力の cwd から解決する。
+判定できないときは拒否する（exit 2）。
+Bash 経由の書き込みは対象外。
+"""
+
+from __future__ import annotations
+
+import json
+import os
+import sys
+from pathlib import Path
+
+PATH_KEYS = {"Edit": "file_path", "Write": "file_path", "NotebookEdit": "notebook_path"}
+
+
+def deny(reason: str) -> int:
+    print(f"hub-guard: {reason}", file=sys.stderr)
+    return 2
+
+
+def check(root: Path, payload: dict) -> str | None:
+    """拒否する理由を返す。許可なら None。"""
+    tool = payload.get("tool_name")
+    if tool not in PATH_KEYS:
+        return None
+    raw = (payload.get("tool_input") or {}).get(PATH_KEYS[tool])
+    if not isinstance(raw, str) or not raw or "\0" in raw:
+        return f"{tool} の書き込み先を判定できません"
+    path = Path(raw)
+    if not path.is_absolute():
+        cwd = payload.get("cwd")
+        if not isinstance(cwd, str) or not os.path.isabs(cwd):
+            return f"相対パスの基準が分かりません: {raw}"
+        path = Path(cwd) / path
+    # NOTE: resolve は存在しない末尾も扱え、途中のリンクと宙づりのリンクの先まで辿る。
+    target = path.resolve()
+    if target != root and root not in target.parents:
+        return (f"司令塔は hub-env の外を編集できません: {target}。"
+                "子リポジトリの変更は、その子のエージェントに herdr agent prompt で依頼してください")
+    return None
+
+
+def main() -> int:
+    try:
+        args = sys.argv[1:]
+        if len(args) != 2 or args[0] != "--root" or not os.path.isabs(args[1]):
+            return deny("usage: hub-guard --root <hub-env の絶対パス>")
+        root = Path(args[1]).resolve()
+        if not root.is_dir():
+            return deny(f"hub-env がありません: {root}")
+        payload = json.load(sys.stdin)
+        if not isinstance(payload, dict):
+            return deny("フックの入力を読めません")
+        reason = check(root, payload)
+        return deny(reason) if reason else 0
+    except Exception as e:  # 判定に失敗したら通さない
+        return deny(f"判定に失敗したので拒否します: {e}")
+
+
+if __name__ == "__main__":
+    sys.exit(main())

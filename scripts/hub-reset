@@ -14,61 +14,22 @@ herdr のペインの中で実行する。環境は、HERDR_SESSION を session 
 
 from __future__ import annotations
 
-import json
 import os
 import shlex
 import subprocess
 import sys
 import time
-import tomllib
 from pathlib import Path
 
-ENVS_FILE = Path(os.environ.get("XDG_CONFIG_HOME") or Path.home() / ".config") / "hub/envs"
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "lib"))
+from hublib import HerdrError, agent_argv, claude_launch_args, find_env, herdr, workspaces  # noqa: E402
+from hublib import HubError as ResetError  # noqa: E402
+
 LOG = Path(os.environ.get("XDG_STATE_HOME") or Path.home() / ".local/state") / "hub-reset.log"
+PLACEHOLDER = "hub-reset-tmp"
 
 ENV_DIR: Path  # main() で決める
-
-
-class ResetError(Exception):
-    pass
-
-
-def herdr(*args: str, check: bool = True) -> dict:
-    p = subprocess.run(["herdr", *args], capture_output=True, text=True)
-    try:
-        out = json.loads(p.stdout) if p.stdout.strip() else {}
-    except json.JSONDecodeError:
-        out = {}
-    if check and (p.returncode != 0 or "error" in out):
-        msg = out.get("error", {}).get("message") or p.stderr.strip() or p.stdout.strip()
-        raise ResetError(f"herdr {' '.join(args)}: {msg}")
-    return out
-
-
-# ── 環境 ───────────────────────────────────────────────────────
-
-
-def registered_envs() -> list[Path]:
-    if not ENVS_FILE.exists():
-        return []
-    return [Path(l) for l in ENVS_FILE.read_text().split() if l]
-
-
-def read_config(env: Path) -> dict | None:
-    try:
-        return tomllib.loads((env / "hub-env/hub.toml").read_text())
-    except (OSError, tomllib.TOMLDecodeError):
-        return None
-
-
-def find_env() -> tuple[Path, dict]:
-    session = os.environ.get("HERDR_SESSION")
-    if not session:
-        raise ResetError("HERDR_SESSION がありません。hub.toml の session に書いたセッションのペインで実行してください")
-    hits = [(e, c) for e in registered_envs() if (c := read_config(e)) and c.get("session") == session]
-    if len(hits) != 1:
-        raise ResetError(f"session '{session}' の環境が {len(hits)} 個あります（{ENVS_FILE}）")
-    return hits[0]
+LAUNCH: list[str] = []  # main() で決める。全エージェントに渡す claude の引数
 
 
 # ── 設定 ───────────────────────────────────────────────────────
@@ -85,6 +46,13 @@ def check_config(cfg: dict) -> None:
         ws["_cwd"] = (ENV_DIR / ws["cwd"]).resolve()
         if not ws["_cwd"].is_dir():
             raise ResetError(f"ワークスペース {ws['label']} の cwd がありません: {ws['_cwd']}")
+        if ws.get("setup"):
+            if "tab" in ws:
+                raise ResetError(f"ワークスペース {ws['label']}: setup と tab は同時に書けません")
+            ws["_setup"] = (ENV_DIR / ws["setup"]).resolve()
+            if not os.access(ws["_setup"], os.X_OK) or not ws["_setup"].is_file():
+                raise ResetError(f"ワークスペース {ws['label']} の setup を実行できません: {ws['_setup']}")
+            continue
         ws.setdefault("tab", [{"label": ws["label"]}])
         for tab in ws["tab"]:
             if not tab.get("label"):
@@ -95,20 +63,30 @@ def check_config(cfg: dict) -> None:
                     raise ResetError(f"タブ {tab['label']} の {i + 1} 番目のペイン: split.from が前のペインの name ではありません")
                 if "agent" in pane and not pane["agent"].get("name"):
                     raise ResetError(f"タブ {tab['label']} の {i + 1} 番目のペイン: agent に name がありません")
+                pane["_cwd"] = (ENV_DIR / pane["cwd"]).resolve() if pane.get("cwd") else ws["_cwd"]
+                if not pane["_cwd"].is_dir():
+                    raise ResetError(f"タブ {tab['label']} の {i + 1} 番目のペイン: cwd がありません: {pane['_cwd']}")
                 names.append(pane.get("name", f"pane{i}"))
 
 
 # ── 組み立て ───────────────────────────────────────────────────
 
 
-def build_tab(tab: dict, root_pane: str, cwd: Path, agents: list) -> None:
-    """タブのペインを分割してコマンドを実行する。エージェントは agents に積んで、後で起動する。"""
+def build_tab(tab: dict, root_pane: str, root_cwd: Path, agents: list) -> None:
+    """タブのペインを分割してコマンドを実行する。エージェントは agents に積んで、後で起動する。
+
+    root_cwd は、タブを作ったときからあるペイン（root_pane）が開いているディレクトリ。
+    """
     panes = tab.get("pane") or [{}]
     ids: dict[str, str] = {}
     for i, pane in enumerate(panes):
         name = pane.get("name", f"pane{i}")
+        cwd = pane.get("_cwd", root_cwd)
         if i == 0:
             pid = root_pane
+            # 最初のペインはワークスペースの cwd で開いているので、別の cwd なら移る
+            if cwd != root_cwd and not pane.get("run"):
+                herdr("pane", "run", pid, f"cd {shlex.quote(str(cwd))}")
         else:
             sp = pane["split"]
             pid = herdr("pane", "split", ids[sp["from"]], "--direction", sp.get("direction", "right"),
@@ -147,8 +125,8 @@ def start_agents(agents: list) -> None:
     for pane, ag in agents:
         name = ag["name"]
         cmd = ["agent", "start", name, "--kind", ag.get("kind", "claude"), "--pane", pane]
-        if ag.get("args"):
-            cmd += ["--", *ag["args"]]
+        if args := agent_argv(ag.get("kind", "claude"), LAUNCH, ag.get("args", [])):
+            cmd += ["--", *args]
         for _ in range(10):
             if subprocess.run(["herdr", *cmd], capture_output=True).returncode == 0:
                 break
@@ -162,30 +140,99 @@ def start_agents(agents: list) -> None:
             print(f"warning: エージェント {name} の起動に失敗しました（pane {pane}）", file=sys.stderr)
 
 
-def workspaces() -> list[dict]:
-    return herdr("workspace", "list")["result"]["workspaces"]
+def run_setup(ws: dict) -> None:
+    """setup のスクリプトでワークスペースを組み立てる。スクリプトは ws の label でワークスペースを作る。"""
+    p = subprocess.run([str(ws["_setup"])], cwd=ws["_cwd"], stdin=subprocess.DEVNULL,
+                       env={**os.environ, "HUB_ENV_DIR": str(ENV_DIR), "HUB_WORKSPACE_LABEL": ws["label"],
+                            "HUB_CLAUDE_ARGS": shlex.join(LAUNCH)})
+    if p.returncode != 0:
+        raise ResetError(f"ワークスペース {ws['label']} の setup が失敗しました（exit {p.returncode}）: {ws['_setup']}")
+    if not any(w["label"] == ws["label"] for w in workspaces()):
+        raise ResetError(f"setup の後にワークスペース {ws['label']} がありません。スクリプトの label と hub.toml を揃えてください")
+
+
+def close_all_except(keep: str) -> None:
+    """keep 以外を全部閉じる。worktree がつながったワークスペースは、つながった分もまとめて閉じる（checkout は消えない）。"""
+    while rest := [w for w in workspaces() if w["workspace_id"] != keep]:
+        # NOTE: worktree 側を先に閉じると、親を閉じるときに --group が要らなくなる。
+        w = next((x for x in rest if (x.get("worktree") or {}).get("is_linked_worktree")), rest[0])
+        try:
+            herdr("workspace", "close", w["workspace_id"])
+        except HerdrError as e:
+            if e.code != "workspace_group_close_required":
+                raise
+            herdr("workspace", "close", w["workspace_id"], "--group")
+        print(f"ワークスペースを閉じました: {w['label']} ({w['workspace_id']})")
 
 
 def reset_all(cfg: dict) -> None:
     wss = cfg["workspace"]
     agents: list = []
+    failed: list[str] = []
     # 1. 1 つ目のワークスペースを先に作る（ワークスペースが 0 個になる瞬間を作らないため）
-    first_id, first_tabs = create_workspace(wss[0], agents)
+    # setup のスクリプトは同じ label の既存ワークスペースを再利用するので、古いものを閉じるまで動かせない。仮の場所を置く
+    placeholder = None
+    if wss[0].get("_setup"):
+        placeholder = herdr("workspace", "create", "--cwd", str(ENV_DIR), "--label", PLACEHOLDER,
+                            "--no-focus")["result"]["workspace"]["workspace_id"]
+        first_id, first_tabs = placeholder, []
+    else:
+        first_id, first_tabs = create_workspace(wss[0], agents)
     # 2. それ以外を全部閉じる（古いエージェントの名前もここで空く）
-    for w in workspaces():
-        if w["workspace_id"] != first_id:
-            herdr("workspace", "close", w["workspace_id"])
-            print(f"ワークスペースを閉じました: {w['label']} ({w['workspace_id']})")
+    close_all_except(first_id)
+    # 3. hub.toml の順に作る（作った順にサイドバーへ並ぶ）
     start_agents(agents)
-    print(f"{wss[0]['label']} を作りました")
-    # 3. 残りを hub.toml の順に作る（作った順にサイドバーへ並ぶ）
-    for ws in wss[1:]:
+    for i, ws in enumerate(wss):
+        if i == 0 and not placeholder:
+            print(f"{ws['label']} を作りました")
+            continue
         agents = []
-        create_workspace(ws, agents)
-        start_agents(agents)
+        try:
+            if ws.get("_setup"):
+                run_setup(ws)
+            else:
+                create_workspace(ws, agents)
+                start_agents(agents)
+        except ResetError as e:
+            # 1 つの setup の失敗で、残りのワークスペースまで失わない
+            print(f"error: {e}", file=sys.stderr)
+            failed.append(ws["label"])
+            continue
         print(f"{ws['label']} を作りました")
-    herdr("workspace", "focus", first_id, check=False)
-    herdr("tab", "focus", first_tabs[0], check=False)
+    if placeholder:
+        herdr("workspace", "close", placeholder)
+        first = next((w for w in workspaces() if w["label"] == wss[0]["label"]), None)
+        if first:
+            herdr("workspace", "focus", first["workspace_id"], check=False)
+    else:
+        herdr("workspace", "focus", first_id, check=False)
+        herdr("tab", "focus", first_tabs[0], check=False)
+    if failed:
+        raise ResetError(f"作れなかったワークスペースがあります: {', '.join(failed)}")
+
+
+def reset_setup_workspace(ws: dict, existing: list[dict]) -> None:
+    """setup のワークスペースを閉じて作り直す。他の作業の worktree を巻き込むなら、何も閉じずに止まる。"""
+    every = workspaces()
+    for old in existing:
+        info = old.get("worktree") or {}
+        if info and not info.get("is_linked_worktree") and any(
+                (o.get("worktree") or {}).get("repo_key") == info.get("repo_key")
+                and (o.get("worktree") or {}).get("is_linked_worktree") for o in every):
+            raise ResetError(f"{ws['label']} には worktree のワークスペースがつながっています。"
+                             "先にその作業を hub-work finish するか、全体の hub-reset を使ってください")
+    # 閉じると 0 個になるなら、仮の場所を置く
+    placeholder = None
+    if len(every) == len(existing):
+        placeholder = herdr("workspace", "create", "--cwd", str(ENV_DIR), "--label", PLACEHOLDER,
+                            "--no-focus")["result"]["workspace"]["workspace_id"]
+    try:
+        for old in existing:
+            herdr("workspace", "close", old["workspace_id"])
+        run_setup(ws)
+    finally:
+        if placeholder:
+            herdr("workspace", "close", placeholder, check=False)
 
 
 def reset_some(cfg: dict, labels: list[str]) -> None:
@@ -194,6 +241,10 @@ def reset_some(cfg: dict, labels: list[str]) -> None:
         ws = by_label[label]
         existing = [w for w in workspaces() if w["label"] == label]
         agents: list = []
+        if ws.get("_setup"):
+            reset_setup_workspace(ws, existing)
+            print(f"{label} を作り直しました")
+            continue
         if not existing:
             create_workspace(ws, agents)
         else:
@@ -218,7 +269,7 @@ def own_workspace_label() -> str | None:
 
 
 def main() -> int:
-    global ENV_DIR
+    global ENV_DIR, LAUNCH
     if any(a in ("-h", "--help") for a in sys.argv[1:]):
         print(__doc__.strip())
         return 0
@@ -229,6 +280,13 @@ def main() -> int:
             raise ResetError(f"知らないオプションです: {bad[0]}")
         ENV_DIR, cfg = find_env()
         check_config(cfg)
+        # 何かを閉じる前に、起動引数の問題を見つける
+        LAUNCH = claude_launch_args(ENV_DIR)
+        for ws in cfg["workspace"]:
+            for tab in ws.get("tab", []):
+                for pane in tab.get("pane", []):
+                    if ag := pane.get("agent"):
+                        agent_argv(ag.get("kind", "claude"), LAUNCH, ag.get("args", []))
         unknown = [l for l in labels if l not in {ws["label"] for ws in cfg["workspace"]}]
         if unknown:
             raise ResetError(f"hub.toml に無いワークスペースです: {', '.join(unknown)}")
