@@ -67,7 +67,7 @@ def main() -> int:
             print("（なし）")
 
         print("\n## 進行中の作業")
-        wd = work_dir(env, cfg)
+        wd = work_dir(env)
         found = False
         if wd.is_dir():
             for f in sorted(wd.glob("*/status.md")):

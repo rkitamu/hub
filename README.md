@@ -98,7 +98,7 @@ hub-check                  # MAP.md・hub.toml・リポジトリ・エージェ�
 
 ### 作業（hub-work）
 
-作業ごとに `<work_dir>/<作業名>/status.md` を作る。`work_dir` は `hub.toml` で変えられ、既定は `hub-env/work`。
+作業ごとに `<hub-env>/work/<作業名>/status.md` を作る。
 
 ```markdown
 ---
@@ -145,7 +145,7 @@ agents = ["todo"]
 
 `hub-reset` と `hub-work` が起動する claude に、次を渡す。agent の `args` とは併用できる（`--settings` と `--append-system-prompt-file` を `args` に書くと衝突として止まる）。
 
-- `--append-system-prompt-file`: `hub/rules/*.md`、`<hub-env>/rules/*.md` の順に連結した生成ファイル。`$XDG_STATE_HOME/hub/envs/<環境>-<ハッシュ>/agent-rules.md` に置く
+- `--append-system-prompt-file`: `<hub-env>/rules/*.md` を連結した生成ファイル（rules が無ければ渡さない）。`$XDG_STATE_HOME/hub/envs/<環境>-<ハッシュ>/agent-rules.md` に置く
 - `--settings`: `<hub-env>/agent-settings.json`（あれば）
 
 反映されるのは、次に起動したエージェントから。`setup` のスクリプトが自分で起動するエージェントには自動では届かないので、スクリプト側で環境変数 `HUB_CLAUDE_ARGS`（シェル用に引用済み）を claude の引数に足す。
@@ -162,7 +162,7 @@ Bash のコマンドを解析し、main / master への `git commit` を拒否�
 
 司令塔の Edit / Write / NotebookEdit について、`..` とシンボリックリンクを解決した実際の書き込み先が hub-env の外なら拒否する。判定できないときも拒否する。
 
-**Bash 経由の書き込みは対象外。** `echo > ../todo/x` のような操作は止められないので、これは誤操作の防止であり、セキュリティの境界ではない。`work_dir` を hub-env の外にすると、司令塔はそこも Edit / Write で編集できない。
+**Bash 経由の書き込みは対象外。** `echo > ../todo/x` のような操作は止められないので、これは誤操作の防止であり、セキュリティの境界ではない。
 
 ## テスト
 

@@ -12,9 +12,7 @@ import tomllib
 from pathlib import Path
 
 ENVS_FILE = Path(os.environ.get("XDG_CONFIG_HOME") or Path.home() / ".config") / "hub/envs"
-HUB_ROOT = Path(__file__).resolve().parent.parent
 STATE_DIR = Path(os.environ.get("XDG_STATE_HOME") or Path.home() / ".local/state") / "hub"
-DEFAULT_WORK_DIR = "hub-env/work"
 DEFAULT_TODO_FILE = "todo/data/active.md"
 FRONT_MATTER_KEYS = ("state", "todo", "repos", "workspace", "agents", "worktrees")
 STATES = ("active", "blocked", "done")
@@ -83,8 +81,8 @@ def find_env() -> tuple[Path, dict]:
     return hits[0]
 
 
-def work_dir(env: Path, cfg: dict) -> Path:
-    return (env / cfg.get("work_dir", DEFAULT_WORK_DIR)).resolve()
+def work_dir(env: Path) -> Path:
+    return (env / "hub-env/work").resolve()
 
 
 def todo_file(env: Path, cfg: dict) -> Path:
@@ -100,11 +98,8 @@ def env_state_dir(env: Path) -> Path:
 
 
 def rule_files(env: Path) -> list[tuple[str, Path]]:
-    """hub/rules、<hub-env>/rules の順に、それぞれ名前順で返す。"""
-    out: list[tuple[str, Path]] = []
-    for prefix, root in (("hub/rules", HUB_ROOT / "rules"), ("hub-env/rules", env / "hub-env/rules")):
-        out += [(f"{prefix}/{f.name}", f) for f in sorted(root.glob("*.md")) if f.is_file()]
-    return out
+    """<hub-env>/rules のファイルを名前順で返す。"""
+    return [(f"hub-env/rules/{f.name}", f) for f in sorted((env / "hub-env/rules").glob("*.md")) if f.is_file()]
 
 
 def build_rules(env: Path) -> Path | None:

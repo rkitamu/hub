@@ -59,7 +59,7 @@ def one_workspace(labels: dict, label: str) -> dict | None:
 
 def ensure_work_repo(env: Path, wd: Path) -> None:
     hub_env = (env / "hub-env").resolve()
-    if hub_env in wd.parents and is_git_repo(hub_env):
+    if is_git_repo(hub_env):
         rel = wd.relative_to(hub_env).as_posix() + "/"
         if git(hub_env, "check-ignore", "-q", rel, check=False).returncode != 0:
             raise HubError(f"{rel} が hub-env の git から外れていません。hub-env/.gitignore に /{rel} を足してください")
@@ -420,8 +420,8 @@ def main() -> int:
     sub.add_parser("list").add_argument("--all", action="store_true")
     a = p.parse_args()
     try:
-        env, cfg = find_env()
-        wd = work_dir(env, cfg)
+        env, _ = find_env()
+        wd = work_dir(env)
         return {"start": cmd_start, "finish": cmd_finish, "resume": cmd_resume, "list": cmd_list}[a.cmd](a, env, wd)
     except HubError as e:
         print(f"error: {e}", file=sys.stderr)

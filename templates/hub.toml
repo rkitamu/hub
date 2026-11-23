@@ -4,8 +4,6 @@
 # 環境を置く herdr のセッション名。hub-reset はこのセッションのペインで実行する。
 session = "hub"
 
-# 作業文書（hub-work）の置き場所。hub-env の中に置くなら hub-env の .gitignore で外す。既定は hub-env/work。
-# work_dir = "hub-env/work"
 # hub-status が期限を読む TODO のファイル。既定は todo/data/active.md。
 # todo_file = "todo/data/active.md"
 

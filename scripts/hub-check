@@ -103,7 +103,7 @@ def check(env: Path, cfg: dict) -> list[str]:
     for name in sorted(in_toml - in_map):
         out.append(f"エージェント {name}: hub.toml にありますが MAP.md にありません")
 
-    work_agents, work_labels = work_records(work_dir(env, cfg))
+    work_agents, work_labels = work_records(work_dir(env))
     live = {a.get("name") for a in live_agents() if a.get("name")}
     for name in sorted(in_toml - live):
         out.append(f"エージェント {name}: hub.toml にありますが動いていません")

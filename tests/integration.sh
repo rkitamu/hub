@@ -12,12 +12,9 @@ T="$(mktemp -d /tmp/hubi.XXXXXX)"
 unset HERDR_ENV HERDR_PANE_ID HERDR_TAB_ID HERDR_WORKSPACE_ID HERDR_SOCKET_PATH HERDR_SESSION
 export XDG_CONFIG_HOME="$T/config" XDG_STATE_HOME="$T/state" SHELL=/bin/bash
 export GIT_AUTHOR_NAME=t GIT_AUTHOR_EMAIL=t@example.invalid GIT_COMMITTER_NAME=t GIT_COMMITTER_EMAIL=t@example.invalid
-# NOTE: hub/rules の実ファイルに依存しないよう、コマンドは一時ディレクトリのコピーから動かす。
-export PATH="$T/bin:$T/hub/scripts:$PATH"
+export PATH="$T/bin:$HUB/scripts:$PATH"
 SOCK="$T/config/herdr/sessions/hubtest/herdr.sock"
-mkdir -p "$T/bin" "$T/config/hub" "$T/state" "$T/argv" "$T/hub/rules"
-cp -R "$HUB/scripts" "$HUB/lib" "$T/hub/"
-printf 'hubルール-固有文字列\n' >"$T/hub/rules/fixture.md"
+mkdir -p "$T/bin" "$T/config/hub" "$T/state" "$T/argv"
 export HUB_TEST_ARGV="$T/argv"
 
 cleanup() {
@@ -159,22 +156,17 @@ t "--settings を渡す" grep -qx -- "$E/hub-env/agent-settings.json" "$A"
 t "--append-system-prompt-file を渡す" grep -qx -- '--append-system-prompt-file' "$A"
 R="$(grep -A1 -- '--append-system-prompt-file' "$A" | tail -1)"
 t "生成物は state ディレクトリにある" bash -c "[[ '$R' == '$T/state/hub/envs/'* ]]"
-t "hub の rules が含まれる" grep -q 'hubルール-固有文字列' "$R"
 t "環境の rules が含まれる" grep -q '環境ルール-固有文字列' "$R"
-order() { [[ "$(grep -n 'hub/rules/fixture.md' "$R" | cut -d: -f1)" -lt "$(grep -n 'hub-env/rules/local.md' "$R" | cut -d: -f1)" ]]; }
-t "hub の rules が環境の rules より先" order
-launch_args() { python3 -c 'import sys; sys.path.insert(0, sys.argv[1]); from pathlib import Path; import hublib; print("\n".join(hublib.claude_launch_args(Path(sys.argv[2]))))' "$T/hub/lib" "$E"; }
-env_rules_only() { launch_args >/dev/null && grep -q '環境ルール-固有文字列' "$R" && ! grep -q 'hubルール-固有文字列' "$R"; }
+launch_args() { python3 -c 'import sys; sys.path.insert(0, sys.argv[1]); from pathlib import Path; import hublib; print("\n".join(hublib.claude_launch_args(Path(sys.argv[2]))))' "$HUB/lib" "$E"; }
 no_rules_arg() { local out; out="$(launch_args)" && ! grep -qx -- '--append-system-prompt-file' <<<"$out"; }
-mv "$T/hub/rules/fixture.md" "$T/fixture.md"
-t "hub/rules が空でも環境の rules を渡す" env_rules_only
-rmdir "$T/hub/rules"
-t "hub/rules が無くても環境の rules を渡す" env_rules_only
+has_rules_arg() { launch_args | grep -qx -- '--append-system-prompt-file' && grep -q '環境ルール-固有文字列' "$R"; }
 mv "$E/hub-env/rules/local.md" "$T/local.md"
-t "rules が 1 つも無ければ引数を渡さない" no_rules_arg
-mv "$T/local.md" "$E/hub-env/rules/local.md"
-mkdir "$T/hub/rules"; mv "$T/fixture.md" "$T/hub/rules/fixture.md"
-t "rules を戻すと生成し直せる" launch_args
+t "rules が空なら引数を渡さない" no_rules_arg
+t "rules が空なら生成物を残さない" test ! -e "$R"
+rmdir "$E/hub-env/rules"
+t "rules が無ければ引数を渡さない" no_rules_arg
+mkdir "$E/hub-env/rules"; mv "$T/local.md" "$E/hub-env/rules/local.md"
+t "rules を戻すと引数を渡す" has_rules_arg
 t "雛形の settings が JSON として正しい" jq -e '.hooks.PreToolUse[0].matcher == "Bash"' "$E/hub-env/agent-settings.json"
 t "雛形は work の直接コミットを許可する" bash -c "jq -r '.hooks.PreToolUse[0].hooks[0].command' '$E/hub-env/agent-settings.json' | grep -qF -- '--allow \"$E/hub-env/work\"'"
 tn "雛形は hub-env の直接コミットを許可しない" bash -c "jq -r '.hooks.PreToolUse[0].hooks[0].command' '$E/hub-env/agent-settings.json' | grep -qF -- '--allow \"$E/hub-env\"'"
