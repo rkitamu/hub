@@ -40,6 +40,18 @@ wait_for() { local i; for i in $(seq 1 50); do "$@" && return 0; perl -e 'select
 cat >"$T/bin/claude" <<'EOF'
 #!/bin/bash
 printf '%s\n' "$@" >"$HUB_TEST_ARGV/$(basename "$PWD").argv"
+# 本物と同じ形の入力で SessionStart フックを実行する。--resume なら同じ ID を使う
+sid="$(cat /proc/sys/kernel/random/uuid)"; settings=""; a=("$@")
+for i in "${!a[@]}"; do
+  [[ "${a[$i]}" == --resume ]] && sid="${a[$((i + 1))]}"
+  [[ "${a[$i]}" == --settings ]] && settings="${a[$((i + 1))]}"
+done
+tr="$HUB_TEST_ARGV/transcripts/$sid.jsonl"; mkdir -p "${tr%/*}"; : >>"$tr"
+if [[ -n "$settings" ]]; then
+  jq -r '.hooks.SessionStart[]?.hooks[]?.command' "$settings" | while IFS= read -r c; do
+    jq -n --arg s "$sid" --arg t "$tr" --arg c "$PWD" '{hook_event_name:"SessionStart",session_id:$s,transcript_path:$t,cwd:$c,source:"startup"}' | bash -c "$c"
+  done
+fi
 echo "fake claude ready"; printf '> '
 while IFS= read -r l; do printf '%s\n' "$l" >>"$HUB_TEST_ARGV/$(basename "$PWD").input"; printf '> '; done
 EOF
@@ -152,7 +164,10 @@ t "todo-view と todo-notes が動く" wait_for viewers
 echo "# rules と agent-settings"
 A="$T/argv/hub-env.argv"
 t "agent の args を保つ" grep -qx -- 'test-model' "$A"
-t "--settings を渡す" grep -qx -- "$E/hub-env/agent-settings.json" "$A"
+HS="$(grep -A1 -- '--settings' "$A" | tail -1)"
+t "hub に生成した設定を渡す" test "$HS" = "$(dirname "$(grep -A1 -- '--append-system-prompt-file' "$A" | tail -1)")/hub-agent-settings.json"
+t "生成した設定は agent-settings のフックを保つ" jq -e '.hooks.PreToolUse[0].matcher == "Bash"' "$HS"
+t "生成した設定に記録フックがある" jq -e '.hooks.SessionStart[0].hooks[0].command | contains("hub-session-record")' "$HS"
 t "--append-system-prompt-file を渡す" grep -qx -- '--append-system-prompt-file' "$A"
 R="$(grep -A1 -- '--append-system-prompt-file' "$A" | tail -1)"
 t "生成物は state ディレクトリにある" bash -c "[[ '$R' == '$T/state/hub/envs/'* ]]"
@@ -217,6 +232,8 @@ t "--add-dir は自分の場所" grep -qxF "$W/tree" "$A"
 tn "他の作業の場所は許可しない" grep -qF "$W/plain" "$A"
 tn "work 全体は許可しない" grep -qxF "Edit(/$W/**)" "$A"
 t "作業エージェントにも rules を渡す" grep -qx -- '--append-system-prompt-file' "$A"
+t "hub 以外には agent-settings をそのまま渡す" grep -qx -- "$E/hub-env/agent-settings.json" "$A"
+tn "hub 以外には記録フックの設定を渡さない" grep -q hub-agent-settings "$A"
 mkdir -p "$W/plain/data"; echo secret >"$W/plain/data/x.csv"; echo memo >"$W/plain/runbook.md"
 t "data/ は git から外れる" git -C "$W" check-ignore -q plain/data/x.csv
 tn "runbook.md は外れない" git -C "$W" check-ignore -q plain/runbook.md
@@ -493,6 +510,57 @@ tn "--handoff なしでは何も送らない" test -s "$HI"
 t "--handoff なしでは handoff.md を作らない" test ! -e "$HF"
 t "--handoff なしでは state のファイルが増えない" test "$before_files" = "$(ls -A "$(dirname "$HF")")"
 t "--help に使い方がある" bash -c 'hub-reset --help | grep -q -- --handoff'
+
+echo "# hub-reset --resume"
+SF="$(dirname "$HF")/hub-session.json"
+AH="$T/argv/hub-env.argv"; AA="$T/argv/todo.argv"
+sid_now() { jq -r .session_id "$SF"; }
+resumes() { grep -A1 -x -- '--resume' "$1" | tail -1 | grep -qxF "$2"; }
+no_resume() { ! grep -qx -- '--resume' "$1"; }
+all_ws() { herdr workspace list | jq -c '[.result.workspaces[].workspace_id]'; }
+t "（前提）全体を立て直す" hub-reset
+t "hub のセッション ID が記録される" test -f "$SF"
+t "記録の権限は 600" test "$(stat -c %a "$SF")" = 600
+sid="$(sid_now)"
+: >"$HI"; rm -f "$AA"
+t "--resume で全体を立て直せる" hub-reset --resume
+t "他のエージェントも起動し直される" wait_for test -f "$AA"
+t "hub は記録された ID で戻る" resumes "$AH" "$sid"
+t "他のエージェントは新規に起動する" no_resume "$AA"
+t "resume 後も ID が変わらない" test "$(sid_now)" = "$sid"
+perl -e 'select(undef,undef,undef,0.5)'
+tn "resume では前置きを送らない" test -s "$HI"
+t "--resume で hub だけのワークスペースを立て直せる" hub-reset hub-env --resume
+t "単体でも記録された ID で戻る" resumes "$AH" "$sid"
+rm -f "$AH"; own="$(ws_id hub-env)"
+HERDR_WORKSPACE_ID="$own" hub-reset --resume >"$T/rout" 2>&1; rc=$?
+t "自分のタブを閉じるときは裏で続ける" test "$rc" -eq 0
+t "裏の実行でも同じ ID で戻る" wait_long bash -c "grep -A1 -x -- --resume '$AH' 2>/dev/null | tail -1 | grep -qxF '$sid'"
+wait_long has_agent hub; wait_long has_ws app; wait_long has_agent todo
+perl -e 'select(undef,undef,undef,1)'
+
+before="$(all_ws)"; tabs="$(tab_ids hub-env)"
+tn "--handoff との同時指定はエラー" hub-reset --handoff 文 --resume
+tn "順序が逆でもエラー" hub-reset --resume --handoff 文
+tn "hub が対象外ならエラー" hub-reset app --resume
+cp "$SF" "$T/session.bak"; rm "$SF"
+hub-reset --resume >"$T/rout" 2>&1; rc=$?
+t "ID が無ければ止まる" test "$rc" -ne 0
+t "ID が無いことを知らせる" grep -q '記録されていません' "$T/rout"
+echo '{broken' >"$SF"
+tn "記録が壊れていれば止まる" hub-reset --resume
+cp "$T/session.bak" "$SF"
+TR="$(jq -r .transcript_path "$SF")"; mv "$TR" "$T/transcript.bak"
+hub-reset --resume >"$T/rout" 2>&1; rc=$?
+t "履歴が無ければ止まる" test "$rc" -ne 0
+t "履歴が無いことを知らせる" grep -q '履歴が見つかりません' "$T/rout"
+mv "$T/transcript.bak" "$TR"
+t "止まったときワークスペースを閉じない" test "$before" = "$(all_ws)"
+t "止まったときタブを閉じない" test "$tabs" = "$(tab_ids hub-env)"
+t "--resume なしは新規に起動する" hub-reset
+t "--resume なしでは再開の引数を渡さない" no_resume "$AH"
+t "--resume なしでは新しい ID が記録される" test "$(sid_now)" != "$sid"
+t "--help に --resume がある" bash -c 'hub-reset --help | grep -q -- --resume'
 
 echo "# install.sh --env: README"
 I="$T/sample-env"

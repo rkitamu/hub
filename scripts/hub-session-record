@@ -1,0 +1,71 @@
+#!/usr/bin/env python3
+"""hub エージェントのセッション ID を記録する SessionStart フック。
+
+usage: hub-session-record --state <記録先> --cwd <hub エージェントの cwd>
+
+hub-reset が hub エージェントにだけ渡す設定から呼ばれる。入力が SessionStart で、cwd が一致し、
+セッション ID と履歴のパスが正しいときだけ、記録を原子的に置き換える（権限 600）。
+記録の失敗でセッションの起動を妨げないよう、常に exit 0 で終わる。
+"""
+
+from __future__ import annotations
+
+import json
+import os
+import sys
+import tempfile
+import uuid
+from pathlib import Path
+
+
+def is_uuid(value: object) -> bool:
+    if not isinstance(value, str):
+        return False
+    try:
+        return str(uuid.UUID(value)) == value
+    except ValueError:
+        return False
+
+
+def record_of(payload: object, cwd: Path) -> dict | None:
+    """記録する内容を返す。記録しない入力なら None。"""
+    if not isinstance(payload, dict) or payload.get("hook_event_name") != "SessionStart":
+        return None
+    sid, transcript, got_cwd = payload.get("session_id"), payload.get("transcript_path"), payload.get("cwd")
+    if not is_uuid(sid) or not isinstance(transcript, str) or not isinstance(got_cwd, str):
+        return None
+    if not os.path.isabs(transcript) or not os.path.isabs(got_cwd) or "\0" in transcript or "\0" in got_cwd:
+        return None
+    if Path(transcript).name != f"{sid}.jsonl" or Path(got_cwd).resolve() != cwd:
+        return None
+    return {"session_id": sid, "transcript_path": transcript, "cwd": str(cwd)}
+
+
+def write_record(path: Path, record: dict) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd, tmp = tempfile.mkstemp(dir=path.parent, prefix=".hub-session.")
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            json.dump(record, f)
+            f.write("\n")
+        os.replace(tmp, path)
+    finally:
+        Path(tmp).unlink(missing_ok=True)
+
+
+def main() -> int:
+    try:
+        args = sys.argv[1:]
+        if len(args) != 4 or args[0] != "--state" or args[2] != "--cwd" \
+                or not os.path.isabs(args[1]) or not os.path.isabs(args[3]):
+            print("hub-session-record: usage: --state <絶対パス> --cwd <絶対パス>", file=sys.stderr)
+            return 0
+        if record := record_of(json.load(sys.stdin), Path(args[3]).resolve()):
+            write_record(Path(args[1]), record)
+    except Exception as e:  # 記録できなくてもセッションは起動させる
+        print(f"hub-session-record: 記録できませんでした: {type(e).__name__}", file=sys.stderr)
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

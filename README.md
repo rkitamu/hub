@@ -37,6 +37,7 @@ git clone <hub> ~/src/hub
 - `hub-check`
 - `hub-guard`
 - `hub-commit-guard`
+- `hub-session-record`
 
 ### 2. 環境を用意する
 
@@ -88,6 +89,7 @@ hub-reset
 hub-reset         # ワークスペースを全部閉じて、hub.toml の通りに作り直す
 hub-reset todo    # todo ワークスペース（hub.toml の label）だけを作り直す
 hub-reset [<label>...] --handoff "<引き継ぎ文>"   # 立て直したあと、新しい hub エージェントへ引き継ぐ
+hub-reset [<label>...] --resume   # セッションを復帰して立て直す
 
 hub-work start <作業名> --repo <repo> [--todo <id>] [--worktree] [--purpose <目的>] [--request <依頼文>]
 hub-work finish <作業名>   # 記録されたものだけを閉じ、archive へ移す
@@ -183,6 +185,7 @@ Bash のコマンドを解析し、main / master への `git commit` を拒否�
 ```sh
 python3 tests/test_hub_guard.py          # hub-guard の単体テスト
 python3 tests/test_hub_commit_guard.py   # hub-commit-guard の単体テスト
+python3 tests/test_hub_session_record.py # hub-session-record の単体テスト
 tests/integration.sh              # 一時ディレクトリの環境と専用の herdr サーバーで通しのテスト
 ```
 
