@@ -363,6 +363,20 @@ t "todo が 1 つだけある" count_ws todo 1
 t "hub-env がある" has_ws hub-env
 t "仮のワークスペースが残らない" no_ws hub-reset-tmp
 
+echo "# install.sh --env: README"
+I="$T/sample-env"
+mkdir "$I"
+install_env() { HOME="$T/install-home" XDG_CONFIG_HOME="$T/install-config" "$HUB/install.sh" --env "$I"; }
+t "環境を作れる" install_env
+t "README ができる" test -f "$I/hub-env/README.md"
+t "README の見出しに環境名が入る" grep -qxF '# hub-env — sample-env' "$I/hub-env/README.md"
+tn "README にプレースホルダーが残らない" grep -qF '{{' "$I/hub-env/README.md"
+t "README に頼み方の表がある" grep -qF '## 司令塔への頼み方' "$I/hub-env/README.md"
+t "sync-guide は配置しない" test ! -e "$I/hub-env/.claude/skills/sync-guide"
+printf '手元の README\n' >"$I/hub-env/README.md"
+t "既存の環境にもう一度実行できる" install_env
+t "既存の README を上書きしない" grep -qxF '手元の README' "$I/hub-env/README.md"
+
 echo
 echo "結果: $pass 件成功 / $fail 件失敗"
 [[ "$fail" -eq 0 ]]
