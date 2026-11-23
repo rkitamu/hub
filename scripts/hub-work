@@ -27,7 +27,8 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "lib"))
 from hublib import (HerdrError, HubError, agent_argv, claude_launch_args, dirty_files, find_env, git,  # noqa: E402
-                    herdr, is_git_repo, live_agents, read_status, work_dir, workspaces, write_status)
+                    herdr, is_git_repo, live_agents, read_status, trust_worktree, untrust_worktree, work_dir,
+                    workspaces, write_status)
 
 NAME_RE = re.compile(r"[a-z][a-z0-9-]{0,19}")
 AGENT_RE = re.compile(r"[a-z][a-z0-9_-]{0,31}")
@@ -111,16 +112,38 @@ def status_path(wd: Path, name: str) -> Path:
 # ── 組み立て（start と resume で共通。あるものは作らない） ───────────
 
 
-def work_access_args(doc_dir: Path) -> list[str]:
-    """その作業のディレクトリだけに書き込みを許す claude の引数。"""
+def work_access_args(doc_dir: Path, branch: str | None = None) -> list[str]:
+    """作業のディレクトリへの書き込みと、worktree なら作業ブランチへの push までを許す claude の引数。"""
     d = str(doc_dir)
-    return ["--add-dir", d, "--allowedTools", f"Edit(/{d}/**)", f"Write(/{d}/**)"]
+    # NOTE: --add-dir は別リポジトリの信頼確認で止まり、work 全体の信頼を求めるので使わない。
+    tools = [f"Read(/{d}/**)", f"Edit(/{d}/**)", f"Write(/{d}/**)"]
+    if branch:
+        # NOTE: push は作業ブランチを名指しした形だけを許す。main や force push は確認に回る。
+        tools += ["Bash(git add:*)", "Bash(git commit:*)", f"Bash(git push -u origin {branch})",
+                  f"Bash(git push origin {branch})", "Bash(gh pr create:*)"]
+    return ["--allowedTools", *tools]
 
 
-def start_agent(agent: dict, pane: str, launch: list[str], doc_dir: Path) -> None:
+def register_trust(env: Path, name: str, wt: dict) -> None:
+    """hub-work が作った worktree に限り、元のリポジトリが信頼済みなら信頼済みとして登録する。"""
+    source = (env / wt["repo"]).resolve()
+    tree = Path(wt["path"]).resolve()
+    try:
+        common = lambda p: git(p, "rev-parse", "--path-format=absolute", "--git-common-dir").stdout.strip()
+        if (tree != (env / ".hub-worktrees" / name / slug(wt["repo"])).resolve() or wt["branch"] != f"work/{name}"
+                or git(tree, "symbolic-ref", "--short", "HEAD").stdout.strip() != wt["branch"]
+                or common(tree) != common(source)):
+            raise HubError(f"hub-work が作った worktree と確認できません: {tree}")
+        if trust_worktree(source, tree):
+            wt["trusted"] = True
+    except HubError as e:
+        print(f"warning: worktree を信頼済みにできませんでした: {e}", file=sys.stderr)
+
+
+def start_agent(agent: dict, pane: str, launch: list[str], doc_dir: Path, branch: str | None = None) -> None:
     kind = agent.get("kind", "claude")
     cmd = ["agent", "start", agent["name"], "--kind", kind, "--pane", pane]
-    if args := agent_argv(kind, launch, [], work_access_args(doc_dir)):
+    if args := agent_argv(kind, launch, [], work_access_args(doc_dir, branch)):
         cmd += ["--", *args]
     deadline = time.monotonic() + 30
     while True:
@@ -184,34 +207,48 @@ def ensure(env: Path, meta: dict, doc_dir: Path) -> list[str]:
             res = herdr("tab", "create", "--workspace", ws["workspace_id"], "--cwd", agent["cwd"],
                         "--label", slug(agent["repo"]), "--no-focus")["result"]
             pane = res["root_pane"]["pane_id"]
-        start_agent(agent, pane, launch, doc_dir)
+        wt = worktrees.get(agent["repo"])
+        if wt and agent.get("kind", "claude") == "claude":
+            register_trust(env, doc_dir.name, wt)
+        start_agent(agent, pane, launch, doc_dir, wt["branch"] if wt else None)
         started.append(agent["name"])
     return started
 
 
-def brief(name: str, path: Path, request: str | None) -> str:
+def brief(env: Path, name: str, path: Path, request: str | None, meta: dict) -> str:
     head = f"あなたは作業「{name}」の担当です。作業文書は {path} です。まず読んでください。"
     rules = (f"消えて困るものは作業コピー（worktree）に置かないでください。finish で削除されます。メモ（手順・調査メモ・再現方法）は "
              f"{path.parent}/runbook.md に、検証データは {path.parent}/data/ に置いてください。秘密情報はどちらにも書かないでください。"
-             "書き込みを許可しているのは、この作業のディレクトリだけです。\n"
+             "担当のリポジトリのほかに書き込んでよいのは、この作業のディレクトリだけです。\n"
              "進捗と結果は、先にこの status.md の本文（進捗・結果）へ書いてください。front matter の state は、"
              "止まったら blocked にします。そのあと herdr agent prompt hub \"<作業名と要約>\" で司令塔へ通知してください。"
              "通知が agent_blocked などで拒否されたら、少し待って再送してください。"
              "timeout の場合は届いた可能性があるので、herdr agent read hub で確かめてから再送してください。"
-             "コミットと push はしないでください。")
+             f"\n作業ブランチ work/{name} へのコミット、push（git push -u origin work/{name}）、PR 作成まで行ってください。"
+             "この範囲はユーザーの承認済みです。remote が無ければコミットまでで構いません。"
+             + ("" if meta["worktrees"] else f"main / master にいるときは、先に work/{name} を切ってください。")
+             + "main / master への直接のコミットと push、PR のマージ、rebase、force push はしないでください。")
+    if any((env / r).resolve() == (env / "hub-env").resolve() for r in meta["repos"]):
+        rules += ("\nhub-env の CLAUDE.md は司令塔向けですが、あなたは司令塔ではなく、この作業の担当です。"
+                  "worktree の中のファイルを変更してください。")
     return "\n".join(x for x in (head, request, rules) if x)
 
 
-def send_briefs(names: list[str], text: str) -> list[str]:
-    """依頼を送り、届けられなかったエージェントを返す。初回のフォルダ信頼などで止まっていると拒否される。"""
+def send_briefs(names: list[str], text: str, doc_dir: Path) -> list[str]:
+    """依頼を送り、届けられなかったエージェントを返す。届かなかった依頼文は作業ディレクトリに残す。"""
     undelivered = []
+    saved = doc_dir / "undelivered-brief.md"
     for name in names:
         try:
             herdr("agent", "prompt", name, text)
         except HerdrError as e:
             undelivered.append(name)
-            print(f"warning: {name} に依頼を送れませんでした（{e.code or e}）。確認に答えてから、次の内容を送ってください:\n"
-                  f"  herdr agent prompt {name} {shlex.quote(text)}", file=sys.stderr)
+            saved.write_text(text + "\n")
+            print(f"warning: {name} に依頼が届いていません（{e.code or e}）。ユーザーに確認し、そのタブの確認に答えてもらってから、"
+                  f"次のコマンドで再送してください:\n  herdr agent prompt {name} \"$(cat {shlex.quote(str(saved))})\"",
+                  file=sys.stderr)
+    if not undelivered:
+        saved.unlink(missing_ok=True)
     return undelivered
 
 
@@ -237,7 +274,9 @@ def cmd_start(a: argparse.Namespace, env: Path, wd: Path) -> int:
         if not path.is_dir():
             raise HubError(f"リポジトリがありません: {path}")
         if path == (env / "hub-env").resolve():
-            raise HubError("hub-env は作業の対象にできません")
+            # NOTE: 司令塔と同じ checkout を触らないよう worktree に限る。CLAUDE.md が司令塔向けなので、役割は依頼文で渡す。
+            if not a.worktree or not a.request:
+                raise HubError("hub-env を対象にするときは --worktree と --request を付けてください")
         ws_label = label
         cwd = path
         if a.worktree:
@@ -280,7 +319,8 @@ def cmd_start(a: argparse.Namespace, env: Path, wd: Path) -> int:
     finally:
         write_status(path, meta, body)
         commit(wd, f"record {a.name}")
-    undelivered = send_briefs(started, brief(a.name, path, a.request)) if a.request else []
+    undelivered = send_briefs(started, brief(env, a.name, path, a.request, meta), path.parent) if a.request else []
+    commit(wd, f"brief {a.name}")
     print(f"作業 {a.name} を始めました: {path}")
     print(f"エージェント: {', '.join(x['name'] for x in agents)}")
     return 1 if undelivered else 0
@@ -297,7 +337,9 @@ def cmd_resume(a: argparse.Namespace, env: Path, wd: Path) -> int:
     finally:
         write_status(path, meta, body)
         commit(wd, f"resume {a.name}")
-    undelivered = send_briefs(started, brief(a.name, path, "hub-reset などで中断した作業の再開です。status.md の進捗から続けてください。"))
+    undelivered = send_briefs(started, brief(env, a.name, path, "hub-reset などで中断した作業の再開です。status.md の進捗から続けてください。", meta),
+                              path.parent)
+    commit(wd, f"brief {a.name}")
     print(f"作業 {a.name} を立て直しました（起動: {', '.join(started) or 'なし'}）")
     return 1 if undelivered else 0
 
@@ -362,6 +404,11 @@ def cmd_finish(a: argparse.Namespace, env: Path, wd: Path) -> int:
         elif tree.exists():
             git((env / wt["repo"]).resolve(), "worktree", "remove", str(tree))
         print(f"worktree を外しました: {tree}（ブランチ {wt['branch']} は残しています）")
+        if wt.get("trusted"):
+            try:
+                untrust_worktree(tree.resolve())
+            except HubError as e:
+                print(f"warning: worktree の信頼の登録を外せませんでした: {e}", file=sys.stderr)
     for label in own - tree_labels:
         if ws := one_workspace(label_map(), label):
             herdr("workspace", "close", ws["workspace_id"])

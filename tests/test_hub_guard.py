@@ -35,6 +35,25 @@ class GuardTest(unittest.TestCase):
             self.assertEqual(self.call(str(self.root / "MAP.md"), tool), 0)
         self.assertEqual(self.call(str(self.root / "new/dir/file.md"), "Write"), 0)
 
+    def test_work_worktree(self):
+        tree = self.env / ".hub-worktrees/w/hub-env"
+        other = self.env / ".hub-worktrees/x/hub-env"
+        for d in (tree, other):
+            d.mkdir(parents=True)
+            (d / ".git").write_text("gitdir: x")
+        def run(project, path):
+            env = {**os.environ, "CLAUDE_PROJECT_DIR": str(project)}
+            data = json.dumps({"tool_name": "Edit", "tool_input": {"file_path": str(path)}, "cwd": str(project)})
+            return subprocess.run([str(GUARD), "--root", str(self.root)], input=data, capture_output=True, text=True, env=env).returncode
+        self.assertEqual(run(tree, tree / "MAP.md"), 0)
+        self.assertEqual(run(tree, self.root / "work/w/status.md"), 0)
+        self.assertEqual(run(tree, other / "MAP.md"), 2)
+        self.assertEqual(run(tree, self.child / "a.md"), 2)
+        self.assertEqual(run(self.root, tree / "MAP.md"), 2)
+        (tree / ".git").unlink()
+        (tree / ".git").mkdir()
+        self.assertEqual(run(tree, tree / "MAP.md"), 2)
+
     def test_allows_relative_inside(self):
         self.assertEqual(self.call("MAP.md"), 0)
         self.assertEqual(self.call("../MAP.md", cwd=self.root / "sub"), 0)

@@ -11,10 +11,13 @@ TODO_HERDR="${1:-}"
 T="$(mktemp -d /tmp/hubi.XXXXXX)"
 unset HERDR_ENV HERDR_PANE_ID HERDR_TAB_ID HERDR_WORKSPACE_ID HERDR_SOCKET_PATH HERDR_SESSION
 export XDG_CONFIG_HOME="$T/config" XDG_STATE_HOME="$T/state" SHELL=/bin/bash
+# NOTE: hub-work が信頼の登録で本物の ~/.claude.json を書かないよう、設定ごと移す。
+export CLAUDE_CONFIG_DIR="$T/claude"
 export GIT_AUTHOR_NAME=t GIT_AUTHOR_EMAIL=t@example.invalid GIT_COMMITTER_NAME=t GIT_COMMITTER_EMAIL=t@example.invalid
 export PATH="$T/bin:$HUB/scripts:$PATH"
 SOCK="$T/config/herdr/sessions/hubtest/herdr.sock"
-mkdir -p "$T/bin" "$T/config/hub" "$T/state" "$T/argv"
+mkdir -p "$T/bin" "$T/config/hub" "$T/state" "$T/argv" "$T/claude"
+echo '{"projects":{}}' >"$T/claude/.claude.json"
 export HUB_TEST_ARGV="$T/argv"
 
 cleanup() {
@@ -203,7 +206,8 @@ echo "# hub-work: 検証"
 tn "archive は作業名に使えない" hub-work start archive --repo app
 tn "不正な作業名を拒否する" hub-work start ../evil --repo app
 tn "存在しないリポジトリを拒否する" hub-work start nope --repo missing
-tn "hub-env を対象にできない" hub-work start nope --repo hub-env
+tn "hub-env は --worktree なしでは対象にできない" hub-work start nope --repo hub-env --request x
+tn "hub-env は --request なしでは対象にできない" hub-work start nope --repo hub-env --worktree
 t "拒否では文書を作らない" test ! -e "$E/hub-env/work/nope"
 
 echo "# hub-work: start / list"
@@ -228,7 +232,8 @@ t "start は data/ を作らない" test ! -e "$W/plain/data"
 A="$T/argv/app.argv"
 t "worktree の作業に自分の場所を許可" grep -qxF "Edit(/$W/tree/**)" "$A"
 t "Write も許可" grep -qxF "Write(/$W/tree/**)" "$A"
-t "--add-dir は自分の場所" grep -qxF "$W/tree" "$A"
+t "Read も許可" grep -qxF "Read(/$W/tree/**)" "$A"
+tn "--add-dir は使わない" grep -qx -- '--add-dir' "$A"
 tn "他の作業の場所は許可しない" grep -qF "$W/plain" "$A"
 tn "work 全体は許可しない" grep -qxF "Edit(/$W/**)" "$A"
 t "作業エージェントにも rules を渡す" grep -qx -- '--append-system-prompt-file' "$A"
@@ -317,6 +322,46 @@ t "再送のコマンドを示す" grep -q 'herdr agent prompt w-blocked' "$T/bl
 t "依頼文が status.md に残る" grep -q '消えてはいけない依頼' "$W/blocked/status.md"
 t "エージェントは残る" has_agent w-blocked
 t "blocked を片付ける" hub-work finish blocked
+
+echo "# hub-work: フォルダ信頼"
+CJ="$T/claude/.claude.json"
+RE="$(cd "$E" && pwd -P)"
+trusted() { jq -e --arg p "$1" '.projects[$p].hasTrustDialogAccepted == true' "$CJ" >/dev/null; }
+jq --arg p "$RE/app" '.projects[$p] = {hasTrustDialogAccepted: true} | .keep = 1' "$CJ" >"$CJ.new" && mv "$CJ.new" "$CJ"
+t "信頼済みのリポジトリで worktree の作業を始める" hub-work start trusta --repo app --worktree
+t "worktree が信頼済みになる" trusted "$RE/.hub-worktrees/trusta/app"
+t "他の設定を保つ" jq -e '.keep == 1' "$CJ"
+A="$T/argv/app.argv"
+t "作業ブランチの push を許可" grep -qxF 'Bash(git push -u origin work/trusta)' "$A"
+tn "push 全体は許可しない" grep -qxF 'Bash(git push:*)' "$A"
+t "trusta を片付ける" hub-work finish trusta
+tn "finish で信頼の登録を外す" trusted "$RE/.hub-worktrees/trusta/app"
+mkdir "$E/plainrepo" && git -C "$E/plainrepo" init -q -b main && git -C "$E/plainrepo" commit -q --allow-empty -m init
+hub-work start trustb --repo plainrepo --worktree >"$T/trustb" 2>&1
+t "未信頼のリポジトリは警告する" grep -q '信頼済みではありません' "$T/trustb"
+tn "未信頼のリポジトリの worktree は登録しない" trusted "$RE/.hub-worktrees/trustb/plainrepo"
+t "trustb を片付ける" hub-work finish trustb
+mkdir "$CJ.lock"
+hub-work start trustc --repo app --worktree >"$T/trustc" 2>&1
+rmdir "$CJ.lock"
+t "登録できないときは警告する" grep -q '信頼済みにできませんでした' "$T/trustc"
+tn "登録できないときは書かない" trusted "$RE/.hub-worktrees/trustc/app"
+t "trustc を片付ける" hub-work finish trustc
+rm -rf "$E/plainrepo"
+
+echo "# hub-work: hub-env と環境の外のリポジトリ"
+mkdir -p "$T/outside/hub" && git -C "$T/outside/hub" init -q -b main && git -C "$T/outside/hub" commit -q --allow-empty -m init
+git -C "$E/hub-env" add -A >/dev/null && git -C "$E/hub-env" commit -q -m init
+t "hub-env を worktree で対象にできる" hub-work start henv --repo hub-env --worktree --request 地図の変更
+t "hub-env の worktree ができる" test -f "$E/.hub-worktrees/henv/hub-env/.git"
+t "役割を依頼文で渡す" bash -c "herdr agent read w-henv --source recent-unwrapped --lines 40 | grep -q 司令塔ではなく"
+t "henv を片付ける" hub-work finish henv
+t "環境の外の hub を対象にできる" hub-work start outer --repo ../outside/hub --worktree
+t "環境の外の worktree ができる" test -f "$E/.hub-worktrees/outer/hub/.git"
+t "outer を片付ける" hub-work finish outer
+t "環境の外の hub を worktree なしで対象にできる" hub-work start outerb --repo ../outside/hub
+t "outerb を片付ける" hub-work finish outerb
+tn "存在しない外のパスは拒否する" hub-work start outerc --repo ../outside/none
 
 echo "# hub-work: resume（hub-reset の後）"
 t "worktree の作業を始める" hub-work start again --repo app --worktree

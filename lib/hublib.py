@@ -8,7 +8,10 @@ import os
 import re
 import subprocess
 import tempfile
+import time
 import tomllib
+from collections.abc import Iterator
+from contextlib import contextmanager
 from pathlib import Path
 
 ENVS_FILE = Path(os.environ.get("XDG_CONFIG_HOME") or Path.home() / ".config") / "hub/envs"
@@ -146,6 +149,84 @@ def agent_argv(kind: str, launch: list[str], own: list[str], extra: list[str] | 
         if any(a == flag or a.startswith(f"{flag}=") for a in own):
             raise HubError(f"agent の args の {flag} は hub が渡す引数と衝突します。rules か agent-settings.json に移してください")
     return [*own, *launch, *(extra or [])]
+
+
+# ── Claude Code のフォルダ信頼 ───────────────────────────────────
+
+
+def claude_config_file() -> Path:
+    base = os.environ.get("CLAUDE_CONFIG_DIR")
+    return (Path(base) if base else Path.home()) / ".claude.json"
+
+
+@contextmanager
+def claude_config(timeout: float = 5.0) -> Iterator[tuple[dict, dict]]:
+    """設定をロックして読み、(全体, projects) を渡す。例外が無ければ置き換えで書き戻す。"""
+    file = claude_config_file().resolve()
+    # NOTE: Claude Code と同じ <file>.lock ディレクトリで排他する。古いロックは奪わず、失敗として扱う。
+    lock = file.with_name(file.name + ".lock")
+    deadline = time.monotonic() + timeout
+    while True:
+        try:
+            lock.mkdir()
+            break
+        except FileExistsError:
+            if time.monotonic() > deadline:
+                raise HubError(f"{file} のロックを取れません")
+            time.sleep(0.1)
+        except OSError as e:
+            raise HubError(f"{file} のロックを取れません: {e}")
+    try:
+        try:
+            data = json.loads(file.read_text())
+        except (OSError, ValueError) as e:
+            raise HubError(f"{file} を読めません: {e}")
+        projects = data.get("projects") if isinstance(data, dict) else None
+        if not isinstance(projects, dict):
+            raise HubError(f"{file} に projects がありません")
+        before = json.dumps(data, sort_keys=True)
+        yield data, projects
+        if json.dumps(data, sort_keys=True) == before:
+            return
+        fd, tmp = tempfile.mkstemp(dir=file.parent, prefix=".claude.json.hub.")
+        try:
+            with os.fdopen(fd, "w") as f:
+                json.dump(data, f, ensure_ascii=False, indent=2)
+                f.flush()
+                os.fsync(f.fileno())
+            os.chmod(tmp, file.stat().st_mode & 0o777)
+            os.replace(tmp, file)
+        except OSError as e:
+            Path(tmp).unlink(missing_ok=True)
+            raise HubError(f"{file} を書けません: {e}")
+    finally:
+        lock.rmdir()
+
+
+def is_trusted(projects: dict, path: Path) -> bool:
+    """Claude Code と同じく、そのフォルダか親が信頼済みなら True。"""
+    return any(isinstance(e := projects.get(str(p)), dict) and e.get("hasTrustDialogAccepted") is True
+               for p in (path, *path.parents))
+
+
+def trust_worktree(source: Path, tree: Path) -> bool:
+    """元のリポジトリが信頼済みなら worktree を登録する。新しく登録したら True。"""
+    with claude_config() as (_, projects):
+        if is_trusted(projects, tree):
+            return False
+        if not is_trusted(projects, source):
+            raise HubError(f"元のリポジトリが信頼済みではありません: {source}")
+        entry = projects.setdefault(str(tree), {})
+        if not isinstance(entry, dict):
+            raise HubError(f"{tree} の設定を読めません")
+        entry["hasTrustDialogAccepted"] = True
+        return True
+
+
+def untrust_worktree(tree: Path) -> None:
+    with claude_config() as (_, projects):
+        if isinstance(entry := projects.get(str(tree)), dict):
+            entry.pop("hasTrustDialogAccepted", None)
 
 
 # ── git ────────────────────────────────────────────────────────

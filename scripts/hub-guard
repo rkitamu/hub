@@ -23,6 +23,17 @@ def deny(reason: str) -> int:
     return 2
 
 
+def own_worktree(root: Path) -> Path | None:
+    """hub-work が作った hub-env の worktree で起動した作業エージェントなら、その worktree を返す。"""
+    project = os.environ.get("CLAUDE_PROJECT_DIR")
+    if not project or not os.path.isabs(project):
+        return None
+    tree = Path(project).resolve()
+    if tree.name == root.name and tree.parent.parent == root.parent / ".hub-worktrees" and (tree / ".git").is_file():
+        return tree
+    return None
+
+
 def check(root: Path, payload: dict) -> str | None:
     """拒否する理由を返す。許可なら None。"""
     tool = payload.get("tool_name")
@@ -39,7 +50,8 @@ def check(root: Path, payload: dict) -> str | None:
         path = Path(cwd) / path
     # NOTE: resolve は存在しない末尾も扱え、途中のリンクと宙づりのリンクの先まで辿る。
     target = path.resolve()
-    if target != root and root not in target.parents:
+    allowed = [r for r in (root, own_worktree(root)) if r]
+    if not any(target == r or r in target.parents for r in allowed):
         return (f"司令塔は hub-env の外を編集できません: {target}。"
                 "子リポジトリの変更は、その子のエージェントに herdr agent prompt で依頼してください")
     return None
