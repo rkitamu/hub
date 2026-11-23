@@ -42,7 +42,7 @@ done
 # ── 環境 ───────────────────────────────────────────────────────
 echo "== hub: 環境 $env_dir"
 HUB_ENV="$env_dir/hub-env"
-mkdir -p "$HUB_ENV/.claude/skills/delegate" "$HUB_ENV/rules"
+mkdir -p "$HUB_ENV/.claude/skills/delegate" "$HUB_ENV/.claude/skills/sync-guide" "$HUB_ENV/rules"
 
 create() {  # create <hub-env からの相対パス> < 中身。既にあれば作らない
   if [[ -e "$HUB_ENV/$1" ]]; then
@@ -57,6 +57,7 @@ sed -e "s|{{HUB}}|$HUB|g" -e "s|{{ENV_NAME}}|$(basename "$env_dir")|g" "$HUB/tem
 create MAP.md <"$HUB/templates/MAP.md"
 create hub.toml <"$HUB/templates/hub.toml"
 create .claude/skills/delegate/SKILL.md <"$HUB/templates/skills/delegate/SKILL.md"
+create .claude/skills/sync-guide/SKILL.md <"$HUB/templates/skills/sync-guide/SKILL.md"
 # hub-reset と hub-work が起動するエージェントに --settings で渡す
 sed -e "s|{{HUB_ENV}}|$HUB_ENV|g" -e "s|{{HUB}}|$HUB|g" "$HUB/templates/agent-settings.json" | create agent-settings.json
 # 作業文書（work/）は hub-env の git に入れない。手元専用の別リポジトリにする
