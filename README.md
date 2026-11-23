@@ -29,7 +29,14 @@ git clone <hub> ~/src/hub
 ~/src/hub/install.sh
 ```
 
-`hub-reset`・`hub-work`・`hub-status`・`hub-check`・`hub-guard`・`hub-commit-guard` が `~/.local/bin` にリンクされる。
+次のコマンドが `~/.local/bin` にリンクされる。
+
+- `hub-reset`
+- `hub-work`
+- `hub-status`
+- `hub-check`
+- `hub-guard`
+- `hub-commit-guard`
 
 ### 2. 環境を用意する
 
@@ -136,7 +143,7 @@ agents = ["todo"]
 
 ### rules と agent-settings.json
 
-`hub-reset` と `hub-work` が起動する claude に、次を渡す。`~/.claude` には何も書かない。agent の `args` とは併用できる（`--settings` と `--append-system-prompt-file` を `args` に書くと衝突として止まる）。
+`hub-reset` と `hub-work` が起動する claude に、次を渡す。agent の `args` とは併用できる（`--settings` と `--append-system-prompt-file` を `args` に書くと衝突として止まる）。
 
 - `--append-system-prompt-file`: `hub/rules/*.md`、`<hub-env>/rules/*.md` の順に連結した生成ファイル。`$XDG_STATE_HOME/hub/envs/<環境>-<ハッシュ>/agent-rules.md` に置く
 - `--settings`: `<hub-env>/agent-settings.json`（あれば）
@@ -145,9 +152,11 @@ agents = ["todo"]
 
 ### hub-commit-guard（main / master へのコミットを拒否するフック）
 
-Bash のコマンドを解析し、main / master への `git commit` を拒否する。`git -C`・`--git-dir`・`GIT_DIR=`・`cd`・複合コマンド・サブシェル・`$(...)`・`bash -c`・`eval`・`env` / `sudo` / `xargs` / `find -exec`・git のエイリアスを辿る。`git switch -c x && git commit` は切り替え先で判定する。判定できないときは拒否する。
+Bash のコマンドを解析し、main / master への `git commit` を拒否する。`git -C`・`--git-dir`・`GIT_DIR=`・`cd`・複合コマンド・サブシェル・`$(...)`・`bash -c`・`eval`・`env` / `sudo` / `xargs` / `find -exec`・git のエイリアスを辿る。`git switch -c x && git commit` は切り替え先で判定する。スクリプトファイルの中身と、実行時に組み立てられる文字列は辿らない。判定できないときは拒否する。
 
-`git merge` と `git merge --continue` は止めないので、remote の無いリポジトリはローカルでマージできる。remote があるリポジトリは PR を介す（`git push` はこのフックの対象外）。作業文書や TODO のデータのように、ローカルでのみバージョン管理するリポジトリだけ `--allow <パス>` で除外する。remote が無いだけのコードや設定のリポジトリは除外しない。雛形は `hub-env/work` だけを除外する。`hub-work` の記録のコミットは Bash を通らないので、このフックの影響を受けない。スクリプトファイルの中身と、実行時に組み立てられる文字列は対象外で、これも誤操作の防止であり、セキュリティの境界ではない。
+`--allow <パス>` で、指定したリポジトリを対象から除外できる。これは誤操作の防止であり、セキュリティの境界ではない。
+
+ブランチ運用の方針は、各環境の `hub-env/rules/commit.md` と `agent-settings.json` の責務とする。
 
 ### hub-guard（子リポジトリの編集を拒否するフック）
 
