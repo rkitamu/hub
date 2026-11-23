@@ -139,7 +139,6 @@ worktrees: []
 
 - `state` は `active` / `blocked` / `done`。front matter の値は JSON で書く（YAML としても読める）。
 - `--repo` には hub-env（`--worktree` と `--request` が必須）と、環境の外のリポジトリ（例: `../src/hub`）も指定できる。
-- 作業エージェントは作業ブランチへのコミット・push・PR 作成まで行う。マージはユーザーが行う。
 - 元のリポジトリが信頼済みなら、`--worktree` の worktree も Claude Code の信頼済みフォルダとして扱う。依頼が届かなかったときは、再送のコマンドを表示する。
 - `--worktree` を付けると、`<環境>/.hub-worktrees/<作業名>/<repo>` にブランチ `work/<作業名>` の worktree を作る。herdr の worktree は 1 つが 1 ワークスペースなので、複数リポジトリでは 2 つ目以降が `w-<作業名>--<repo>` になる。
 - `finish` は worktree に未コミットの変更があれば、何も閉じずに止まる。ブランチは消さない。`.gitignore` された未追跡ファイルは未コミットの変更に数えず、worktree と一緒に消える。
