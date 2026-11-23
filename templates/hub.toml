@@ -4,10 +4,20 @@
 # 環境を置く herdr のセッション名。hub-reset はこのセッションのペインで実行する。
 session = "hub"
 
+# 作業文書（hub-work）の置き場所。hub-env の中に置くなら hub-env の .gitignore で外す。既定は hub-env/work。
+# work_dir = "hub-env/work"
+# hub-status が期限を読む TODO のファイル。既定は todo/data/active.md。
+# todo_file = "todo/data/active.md"
+
 # ── ワークスペース ──────────────────────────────────────────────
 # [[workspace]] を書いた順に、herdr のサイドバーへ並ぶ。
 #   label  ワークスペースの名前。hub-reset <label> で、そのワークスペースだけを作り直せる
 #   cwd    ワークスペースのディレクトリ。ペインは、ペインの cwd を書かなければここで開く
+#   setup  タブとペインの定義の代わりに、このスクリプトで組み立てる（環境からの相対パス。tab とは同時に書けない）
+#          スクリプトは cwd で実行され、label と同じ名前のワークスペースを作る。環境変数 HUB_ENV_DIR・HUB_WORKSPACE_LABEL が渡る
+#          hub-reset は、既存のワークスペースを閉じてから実行する
+#          スクリプトが起動するエージェントに rules を渡すには、環境変数 HUB_CLAUDE_ARGS（シェル用に引用済み）を claude の引数に足す
+#   agents setup が起動するエージェントの名前の一覧（省略可）。hub-check の照合に使う
 #
 # [[workspace.tab]] を書いた順に、タブが並ぶ。
 #   label  タブの名前
@@ -40,6 +50,14 @@ label = "Shell"
 # このままでは動かないので、自分の子リポジトリに合わせて書き換え、コメントを外して使う。
 # 子リポジトリごとに [[workspace]] を 1 つ足す。要らなければ消してよい。
 #
+# todo リポジトリの組み立てスクリプトを使うなら、次の 4 行だけでよい（下のタブ定義は要らない）。
+# [[workspace]]
+# label = "todo"
+# cwd = "todo"
+# setup = "todo/contrib/herdr/todo-herdr"
+# agents = ["todo"]
+#
+# スクリプトを使わず、ペインを定義するなら次のように書く。
 # [[workspace]]
 # label = "todo"
 # cwd = "todo"
