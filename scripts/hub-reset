@@ -8,25 +8,41 @@
 usage:
   hub-reset            ワークスペースを全部閉じて、hub.toml の順に作り直す
   hub-reset <label>…   指定したワークスペースだけを作り直す
+  hub-reset [<label>…] --handoff "<引き継ぎ文>"
+                       立て直したあと、新しい hub エージェントへ引き継ぎ文を送る
+
+--handoff の値は - で始まっていても、空白や改行を含んでいてもよい。hub が立て直す対象に無ければ、何も閉じずに止まる。
+引き継ぎ文は、届くまで環境の state ディレクトリの handoff.md（権限 600）に残る。秘密情報は書かない。
+未配送の handoff.md があるときは上書きせずに止まる。届いていないことを確かめて送り直すか、不要なら消す。
 
 herdr のペインの中で実行する。環境は、HERDR_SESSION を session に書いた ~/.config/hub/envs の環境。
 """
 
 from __future__ import annotations
 
+import json
 import os
+import secrets
 import shlex
 import subprocess
 import sys
+import tempfile
 import time
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "lib"))
-from hublib import HerdrError, agent_argv, claude_launch_args, find_env, herdr, workspaces  # noqa: E402
+from hublib import HerdrError, agent_argv, claude_launch_args, env_state_dir, find_env, herdr, workspaces  # noqa: E402
 from hublib import HubError as ResetError  # noqa: E402
 
 LOG = Path(os.environ.get("XDG_STATE_HOME") or Path.home() / ".local/state") / "hub-reset.log"
 PLACEHOLDER = "hub-reset-tmp"
+HUB_AGENT = "hub"
+# NOTE: 1 つの引数の上限（128KiB）を、前置きを足しても超えないようにする。
+HANDOFF_MAX_BYTES = 100_000
+# 信頼確認などにユーザーが答えられるよう待つ秒数。テストでは環境変数 HUB_RESET_HANDOFF_WAIT で短くする。
+HANDOFF_WAIT = 180.0
+HANDOFF_PREAMBLE = ("これは hub-reset 前の司令塔からの引き継ぎです。前のセッションの許可は引き継がれていません。"
+                    "確認が必要な操作は、改めてユーザーに確認してください。")
 
 ENV_DIR: Path  # main() で決める
 LAUNCH: list[str] = []  # main() で決める。全エージェントに渡す claude の引数
@@ -211,9 +227,7 @@ def reset_all(cfg: dict) -> None:
         raise ResetError(f"作れなかったワークスペースがあります: {', '.join(failed)}")
 
 
-def reset_setup_workspace(ws: dict, existing: list[dict]) -> None:
-    """setup のワークスペースを閉じて作り直す。他の作業の worktree を巻き込むなら、何も閉じずに止まる。"""
-    every = workspaces()
+def check_worktree_links(ws: dict, existing: list[dict], every: list[dict]) -> None:
     for old in existing:
         info = old.get("worktree") or {}
         if info and not info.get("is_linked_worktree") and any(
@@ -221,6 +235,12 @@ def reset_setup_workspace(ws: dict, existing: list[dict]) -> None:
                 and (o.get("worktree") or {}).get("is_linked_worktree") for o in every):
             raise ResetError(f"{ws['label']} には worktree のワークスペースがつながっています。"
                              "先にその作業を hub-work finish するか、全体の hub-reset を使ってください")
+
+
+def reset_setup_workspace(ws: dict, existing: list[dict]) -> None:
+    """setup のワークスペースを閉じて作り直す。他の作業の worktree を巻き込むなら、何も閉じずに止まる。"""
+    every = workspaces()
+    check_worktree_links(ws, existing, every)
     # 閉じると 0 個になるなら、仮の場所を置く
     placeholder = None
     if len(every) == len(existing):
@@ -258,6 +278,143 @@ def reset_some(cfg: dict, labels: list[str]) -> None:
         print(f"{label} を作り直しました")
 
 
+# ── 引き継ぎ ───────────────────────────────────────────────────
+# NOTE: 引き継ぎ文は環境変数・ログ・エラーメッセージに出さない。共通の herdr() はエラーに引数を含めるので、送信には使わない。
+
+
+def build_handoff(text: str) -> str:
+    """送る本文を作る。1 行目は、timeout のあとに画面で届いたかを確かめる目印にする。"""
+    body = f"[hub-reset 引き継ぎ {secrets.token_hex(4)}]\n{HANDOFF_PREAMBLE}\n\n--- 引き継ぎ文 ---\n{text}"
+    try:
+        size = len(body.encode())
+    except UnicodeEncodeError:
+        raise ResetError("--handoff の引き継ぎ文を UTF-8 として扱えません")
+    if size > HANDOFF_MAX_BYTES:
+        raise ResetError(f"--handoff の引き継ぎ文が長すぎます（前置きを含めて {HANDOFF_MAX_BYTES} バイトまで）")
+    return body
+
+
+def pending_message(path: Path) -> str:
+    return (f"未配送の引き継ぎがあります: {path}\n"
+            f'  届いていなければ herdr agent prompt {HUB_AGENT} "$(cat {shlex.quote(str(path))})" で送り、'
+            "届いたか不要なら、このファイルを消してください")
+
+
+def save_handoff(path: Path, body: str) -> None:
+    """権限 600 で原子的に保存する。既にあれば上書きしない。"""
+    if os.path.lexists(path):
+        raise ResetError(pending_message(path))
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd, tmp = tempfile.mkstemp(dir=path.parent, prefix=".handoff.")
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            f.write(body)
+            f.flush()
+            os.fsync(f.fileno())
+        try:
+            # NOTE: rename は既存のファイルを置き換えるので、同時実行でも上書きしない link を使う。
+            os.link(tmp, path)
+        except FileExistsError:
+            raise ResetError(pending_message(path))
+    except OSError as e:
+        raise ResetError(f"引き継ぎを保存できません: {path}: {e.strerror}")
+    finally:
+        Path(tmp).unlink(missing_ok=True)
+
+
+def hub_is_target(cfg: dict, labels: list[str]) -> bool:
+    for ws in cfg["workspace"]:
+        if labels and ws["label"] not in labels:
+            continue
+        if HUB_AGENT in ws.get("agents", []):
+            return True
+        for tab in ws.get("tab", []):
+            if any(p.get("agent", {}).get("name") == HUB_AGENT for p in tab.get("pane", [])):
+                return True
+    return False
+
+
+def hub_state() -> dict:
+    return herdr("agent", "get", HUB_AGENT, check=False).get("result", {}).get("agent", {})
+
+
+def send_handoff(body: str) -> str:
+    """送信して結果を返す: ok / blocked / timeout / その他のエラーコード。"""
+    try:
+        p = subprocess.run(["herdr", "agent", "prompt", HUB_AGENT, body], capture_output=True, text=True, timeout=30)
+    except subprocess.TimeoutExpired:
+        return "timeout"
+    except OSError:
+        return "herdr_failed"
+    code = None
+    for stream in (p.stdout, p.stderr):
+        try:
+            parsed = json.loads(stream) if stream.strip() else {}
+        except json.JSONDecodeError:
+            continue
+        if isinstance(parsed, dict) and isinstance(parsed.get("error"), dict):
+            code = parsed["error"].get("code")
+            break
+    if p.returncode == 0 and code is None:
+        return "ok"
+    return {"agent_blocked": "blocked"}.get(code, code or "prompt_failed")
+
+
+def seen_on_screen(marker: str) -> bool:
+    for _ in range(5):
+        p = subprocess.run(["herdr", "agent", "read", HUB_AGENT, "--source", "recent-unwrapped", "--lines", "400"],
+                           capture_output=True, text=True)
+        if p.returncode == 0 and marker in p.stdout:
+            return True
+        time.sleep(1)
+    return False
+
+
+def deliver_handoff(path: Path, old_terminal: str | None) -> bool:
+    """新しい hub が入力可能になるのを待って送る。届いたら消し、届かなければ残す。"""
+    def give_up(reason: str) -> bool:
+        print(f"warning: 引き継ぎを届けられませんでした（{reason}）。\n{pending_message(path)}", file=sys.stderr, flush=True)
+        return False
+
+    try:
+        body = path.read_text(encoding="utf-8")
+    except (OSError, UnicodeDecodeError) as e:
+        return give_up(f"読めません: {type(e).__name__}")
+    marker = body.split("\n", 1)[0]
+    try:
+        wait = float(os.environ.get("HUB_RESET_HANDOFF_WAIT") or HANDOFF_WAIT)
+    except ValueError:
+        wait = HANDOFF_WAIT
+    deadline = time.monotonic() + wait
+    noted = False
+    while True:
+        st = hub_state()
+        status = st.get("agent_status")
+        # 古い hub へ送らないよう、端末が変わったことを確かめる
+        if st and st.get("terminal_id") != old_terminal and st.get("interactive_ready") and status in ("idle", "done"):
+            result = send_handoff(body)
+            if result == "ok":
+                path.unlink(missing_ok=True)
+                print("引き継ぎを hub へ届けました", flush=True)
+                return True
+            if result == "timeout":
+                # 届いた可能性があるので、画面で確かめる。長い文は省略表示されうるので、見えなくても再送しない
+                if seen_on_screen(marker):
+                    path.unlink(missing_ok=True)
+                    print("引き継ぎが hub の画面に届いていることを確かめました", flush=True)
+                    return True
+                return give_up("送信が timeout し、届いたか確かめられないので再送しません。hub の画面を確認してください")
+            if result != "blocked":
+                return give_up(result)
+            status = "blocked"
+        if status == "blocked" and not noted:
+            noted = True
+            print(f"note: hub が確認待ちです。hub のタブで答えてください（最大 {wait:.0f} 秒待ちます）", file=sys.stderr, flush=True)
+        if time.monotonic() >= deadline:
+            return give_up("hub が入力可能になりませんでした")
+        time.sleep(0.5)
+
+
 # ── 入口 ───────────────────────────────────────────────────────
 
 
@@ -268,17 +425,60 @@ def own_workspace_label() -> str | None:
     return herdr("workspace", "get", wid, check=False).get("result", {}).get("workspace", {}).get("label")
 
 
+def parse_args(argv: list[str]) -> tuple[list[str], str | None, bool, str | None]:
+    """(labels, 引き継ぎ文, help か, エラー) を返す。--handoff の値は - で始まっていてもオプションと見なさない。"""
+    labels: list[str] = []
+    text: str | None = None
+    show_help = False
+    error: str | None = None
+    seen = False
+    i = 0
+    while i < len(argv):
+        a = argv[i]
+        i += 1
+        if a in ("-h", "--help"):
+            show_help = True
+        elif a == "--handoff" or a.startswith("--handoff="):
+            if seen:
+                error = error or "--handoff は 1 回だけ指定してください"
+            seen = True
+            if "=" in a:
+                value: str | None = a.split("=", 1)[1]
+            elif i < len(argv):
+                value = argv[i]
+                i += 1
+            else:
+                value = None
+            if value is None or not value.strip():
+                error = error or "--handoff に引き継ぎ文を指定してください"
+            else:
+                text = value
+        else:
+            labels.append(a)
+    return labels, text, show_help, error
+
+
 def main() -> int:
     global ENV_DIR, LAUNCH
-    if any(a in ("-h", "--help") for a in sys.argv[1:]):
+    labels, text, show_help, arg_error = parse_args(sys.argv[1:])
+    if show_help:
         print(__doc__.strip())
         return 0
+    # NOTE: setup のスクリプトへ受け継がせないよう、最初に取り除く。
+    resumed = os.environ.pop("HUB_RESET_HANDOFF_PENDING", None) == "1"
+    handoff: Path | None = None
     try:
-        labels = sys.argv[1:]
+        if arg_error:
+            raise ResetError(arg_error)
         bad = [a for a in labels if a.startswith("-")]
         if bad:
             raise ResetError(f"知らないオプションです: {bad[0]}")
         ENV_DIR, cfg = find_env()
+        handoff_path = env_state_dir(ENV_DIR) / "handoff.md"
+        if resumed:
+            if not handoff_path.is_file():
+                raise ResetError(f"引き継ぎのファイルがありません: {handoff_path}")
+            handoff = handoff_path
         check_config(cfg)
         # 何かを閉じる前に、起動引数の問題を見つける
         LAUNCH = claude_launch_args(ENV_DIR)
@@ -291,25 +491,58 @@ def main() -> int:
         if unknown:
             raise ResetError(f"hub.toml に無いワークスペースです: {', '.join(unknown)}")
 
+        if text is not None or resumed:
+            if not hub_is_target(cfg, labels):
+                raise ResetError(f"--handoff には、エージェント {HUB_AGENT} を立て直す必要があります。"
+                                 f"{HUB_AGENT} のいるワークスペースを対象に含めてください")
+            if labels:
+                every = workspaces()
+                for ws in cfg["workspace"]:
+                    if ws["label"] in labels and ws.get("_setup"):
+                        check_worktree_links(ws, [w for w in every if w["label"] == ws["label"]], every)
+        if text is not None:
+            save_handoff(handoff_path, build_handoff(text))
+            handoff = handoff_path
+
         # 自分のいるワークスペースも閉じるなら、端末から切り離して続ける
         if os.environ.get("HERDR_WORKSPACE_ID") and not os.environ.get("HUB_RESET_DETACHED"):
             if not labels or own_workspace_label() in labels:
-                LOG.parent.mkdir(parents=True, exist_ok=True)
-                with open(LOG, "w") as log:
-                    subprocess.Popen([sys.argv[0], *labels], stdin=subprocess.DEVNULL, stdout=log,
-                                     stderr=subprocess.STDOUT, start_new_session=True,
-                                     env={**os.environ, "HUB_RESET_DETACHED": "1"})
+                # NOTE: 引き継ぎ文は引数にも環境変数にも載せず、裏の実行は handoff.md から読む。
+                child_env = {**os.environ, "HUB_RESET_DETACHED": "1"}
+                if handoff:
+                    child_env["HUB_RESET_HANDOFF_PENDING"] = "1"
+                try:
+                    LOG.parent.mkdir(parents=True, exist_ok=True)
+                    with open(LOG, "w") as log:
+                        subprocess.Popen([sys.argv[0], *labels], stdin=subprocess.DEVNULL, stdout=log,
+                                         stderr=subprocess.STDOUT, start_new_session=True, env=child_env)
+                except OSError as e:
+                    if handoff is None:
+                        raise
+                    # まだ何も閉じていないので、次の実行を止めないよう片付ける
+                    handoff.unlink(missing_ok=True)
+                    handoff = None
+                    raise ResetError(f"裏の実行を始められません: {e.strerror}")
                 print(f"このタブも閉じられるので、裏で立て直します。経過: {LOG}")
                 return 0
 
+        old_terminal = hub_state().get("terminal_id") if handoff else None
         if labels:
             reset_some(cfg, labels)
         else:
             reset_all(cfg)
+        if handoff:
+            return 0 if deliver_handoff(handoff, old_terminal) else 1
         return 0
     except ResetError as e:
-        print(f"error: {e}", file=sys.stderr)
+        print(f"error: {e}", file=sys.stderr, flush=True)
+        if handoff:
+            print(pending_message(handoff), file=sys.stderr, flush=True)
         return 1
+    except Exception:
+        if handoff:
+            print(pending_message(handoff), file=sys.stderr, flush=True)
+        raise
 
 
 if __name__ == "__main__":

@@ -41,7 +41,7 @@ cat >"$T/bin/claude" <<'EOF'
 #!/bin/bash
 printf '%s\n' "$@" >"$HUB_TEST_ARGV/$(basename "$PWD").argv"
 echo "fake claude ready"; printf '> '
-while IFS= read -r l; do printf '> '; done
+while IFS= read -r l; do printf '%s\n' "$l" >>"$HUB_TEST_ARGV/$(basename "$PWD").input"; printf '> '; done
 EOF
 chmod +x "$T/bin/claude"
 
@@ -362,6 +362,137 @@ t "先頭が setup でも全体リセットできる" hub-reset
 t "todo が 1 つだけある" count_ws todo 1
 t "hub-env がある" has_ws hub-env
 t "仮のワークスペースが残らない" no_ws hub-reset-tmp
+
+echo "# hub-reset --handoff"
+HF="$(dirname "$R")/handoff.md"
+HI="$T/argv/hub-env.input"
+REAL_HERDR="$(command -v herdr)"
+mkdir "$T/handoffbin"
+# agent prompt の結果を HANDOFF_STUB で差し替え、呼び出しを数える。全呼び出しの引数と環境も記録する
+cat >"$T/handoffbin/herdr" <<EOF
+#!/bin/bash
+env >>"$T/handoff-env"
+if [[ "\$1 \$2" == "agent prompt" ]]; then
+  echo x >>"$T/handoff-prompts"
+  n="\$(wc -l <"$T/handoff-prompts")"
+  case "\${HANDOFF_STUB:-}" in
+    fail) echo '{"error":{"code":"agent_not_found","message":"x"}}' >&2; exit 1 ;;
+    timeout) echo '{"error":{"code":"timeout","message":"x"}}' >&2; exit 1 ;;
+    sent-timeout) "$REAL_HERDR" "\$@" >/dev/null; echo '{"error":{"code":"timeout","message":"x"}}' >&2; exit 1 ;;
+    blocked) echo '{"error":{"code":"agent_blocked","message":"x"}}' >&2; exit 1 ;;
+    blocked-once) if [[ "\$n" == 1 ]]; then echo '{"error":{"code":"agent_blocked","message":"x"}}' >&2; exit 1; fi ;;
+  esac
+fi
+exec "$REAL_HERDR" "\$@"
+EOF
+chmod +x "$T/handoffbin/herdr"
+hstub() { local mode="$1"; shift; : >"$T/handoff-prompts"; PATH="$T/handoffbin:$PATH" HANDOFF_STUB="$mode" HUB_RESET_HANDOFF_WAIT=3 hub-reset "$@"; }
+prompts_are() { [[ "$(wc -l <"$T/handoff-prompts")" == "$1" ]]; }
+ws_id() { herdr workspace list | jq -r --arg l "$1" '.result.workspaces[] | select(.label == $l) | .workspace_id'; }
+tab_ids() { herdr tab list --workspace "$(ws_id "$1")" | jq -c '[.result.tabs[].tab_id]'; }
+wait_long() { local i; for i in $(seq 1 300); do "$@" && return 0; perl -e 'select(undef,undef,undef,0.2)'; done; return 1; }
+input_has() { [[ -f "$HI" && "$(cat "$HI")" == *"$1"* ]]; }
+input_count() { [[ "$(grep -c -F -- "$1" "$HI")" == "$2" ]]; }
+SPECIAL=$'--help -x "二重" \'単一\' $HOME `id` \\back\n二行目 ; rm -rf nope && echo x\n\n  字下げ-固有文字列'
+
+: >"$HI"
+t "特殊文字の引き継ぎで全体を立て直せる" hub-reset --handoff "$SPECIAL"
+t "引き継ぎ文が壊れずに届く" wait_for input_has "$SPECIAL"
+t "前置きが添えられる" input_has '前のセッションの許可は引き継がれていません'
+t "確認の前置きが添えられる" input_has '改めてユーザーに確認してください'
+t "配送に成功したら handoff.md を消す" test ! -e "$HF"
+t "全エージェントを立て直している" has_agent todo
+
+: >"$HI"
+t "- で始まる文を値として扱う" hub-reset hub-env --handoff -h
+t "-h が届く" wait_for input_has $'--- 引き継ぎ文 ---\n-h'
+t "--handoff=値 の形も使える" bash -c ': >"$1"; hub-reset hub-env "--handoff=等号の値-固有文字列"' _ "$HI"
+t "等号の値が届く" wait_for input_has '等号の値-固有文字列'
+
+before="$(tab_ids hub-env)"
+tn "空文字はエラー" hub-reset hub-env --handoff ""
+tn "空白だけはエラー" hub-reset hub-env --handoff "   "
+tn "値の欠落はエラー" hub-reset hub-env --handoff
+tn "二重指定はエラー" hub-reset hub-env --handoff a --handoff b
+t "引数エラーでは何も閉じない" test "$before" = "$(tab_ids hub-env)"
+t "引数エラーでは保存しない" test ! -e "$HF"
+
+before="$(tab_ids app)"; hub_before="$(tab_ids hub-env)"
+hub-reset app --handoff 対象外 >"$T/hout" 2>&1; rc=$?
+t "hub が対象外ならエラー" test "$rc" -ne 0
+t "エラーが hub を示す" grep -q 'エージェント hub' "$T/hout"
+t "hub が対象外なら対象を閉じない" test "$before" = "$(tab_ids app)"
+t "hub が対象外なら hub も閉じない" test "$hub_before" = "$(tab_ids hub-env)"
+t "hub が対象外なら保存しない" test ! -e "$HF"
+
+hstub fail hub-env --handoff '配送失敗-固有文字列' >"$T/hout" 2>&1; rc=$?
+t "配送に失敗したら失敗を返す" test "$rc" -ne 0
+t "配送に失敗したら残す" test -f "$HF"
+t "handoff.md の権限は 600" test "$(stat -c %a "$HF")" = 600
+t "handoff.md に引き継ぎ文がある" grep -q '配送失敗-固有文字列' "$HF"
+t "失敗のログに場所を出す" grep -qF "$HF" "$T/hout"
+tn "失敗のログに引き継ぎ文を出さない" grep -q '配送失敗-固有文字列' "$T/hout"
+cp "$HF" "$T/handoff.keep"; before="$(tab_ids hub-env)"
+hub-reset hub-env --handoff 別の文 >"$T/hout" 2>&1; rc=$?
+t "未配送があると止まる" test "$rc" -ne 0
+t "止まる理由に場所を示す" grep -qF "$HF" "$T/hout"
+t "未配送のファイルを上書きしない" cmp "$HF" "$T/handoff.keep"
+t "未配送があれば何も閉じない" test "$before" = "$(tab_ids hub-env)"
+rm "$HF"
+
+: >"$HI"
+hstub timeout hub-env --handoff 'timeout未着-固有文字列' >"$T/hout" 2>&1; rc=$?
+t "timeout で画面に無ければ失敗を返す" test "$rc" -ne 0
+t "timeout で画面に無ければ再送しない" prompts_are 1
+t "timeout で画面に無ければ残す" test -f "$HF"
+rm -f "$HF"
+: >"$HI"
+hstub sent-timeout hub-env --handoff 'timeout到着-固有文字列' >"$T/hout" 2>&1; rc=$?
+t "timeout でも画面にあれば成功" test "$rc" -eq 0
+t "timeout でも届いていれば再送しない" prompts_are 1
+t "timeout でも届いていれば消す" test ! -e "$HF"
+t "二重に届かない" input_count 'timeout到着-固有文字列' 1
+
+: >"$HI"
+t "blocked の間は待って送る" hstub blocked-once hub-env --handoff 'blocked解除-固有文字列'
+t "blocked の解除後に届く" wait_for input_has 'blocked解除-固有文字列'
+t "blocked のあと消す" test ! -e "$HF"
+hstub blocked hub-env --handoff 'blocked継続-固有文字列' >"$T/hout" 2>&1; rc=$?
+t "blocked が続けば失敗を返す" test "$rc" -ne 0
+t "blocked が続けば残す" test -f "$HF"
+rm -f "$HF"
+
+cp "$E/hub-env/hub.toml" "$T/toml.handoff"
+printf '\n[[workspace]]\nlabel = "broken"\ncwd = "app"\nsetup = "broken-setup"\n' >>"$E/hub-env/hub.toml"
+printf '#!/bin/bash\nexit 1\n' >"$E/broken-setup"; chmod +x "$E/broken-setup"
+hub-reset --handoff '立て直し失敗-固有文字列' >"$T/hout" 2>&1; rc=$?
+t "立て直しに失敗したら失敗を返す" test "$rc" -ne 0
+t "立て直しに失敗したら残す" test -f "$HF"
+t "立て直しの失敗でも場所を出す" grep -qF "$HF" "$T/hout"
+rm -f "$HF" "$E/broken-setup"; cp "$T/toml.handoff" "$E/hub-env/hub.toml"
+t "失敗のあと元の構成へ戻せる" hub-reset
+
+: >"$HI"; : >"$T/handoff-env"; : >"$T/handoff-prompts"
+own="$(ws_id hub-env)"
+PATH="$T/handoffbin:$PATH" HERDR_WORKSPACE_ID="$own" hub-reset --handoff $'裏実行-固有文字列\n二行目' >"$T/hout" 2>&1; rc=$?
+t "自分のタブを閉じるときは裏で続ける" test "$rc" -eq 0
+t "裏で続けることを知らせる" grep -q '裏で立て直します' "$T/hout"
+t "裏の実行でも引き継ぎが届く" wait_long input_has $'裏実行-固有文字列\n二行目'
+t "裏の実行でも配送後に消す" wait_long test ! -e "$HF"
+t "裏の実行のログに成功が出る" wait_long grep -q '引き継ぎを hub へ届けました' "$T/state/hub-reset.log"
+tn "裏の実行のログに引き継ぎ文を出さない" grep -q '裏実行-固有文字列' "$T/state/hub-reset.log"
+tn "環境変数に引き継ぎ文を出さない" grep -q '裏実行-固有文字列' "$T/handoff-env"
+t "裏の実行は 1 回だけ送る" prompts_are 1
+
+: >"$HI"
+before_files="$(ls -A "$(dirname "$HF")")"
+t "--handoff なしでも単体で立て直せる" hub-reset hub-env
+t "--handoff なしでも全体を立て直せる" hub-reset
+perl -e 'select(undef,undef,undef,0.5)'
+tn "--handoff なしでは何も送らない" test -s "$HI"
+t "--handoff なしでは handoff.md を作らない" test ! -e "$HF"
+t "--handoff なしでは state のファイルが増えない" test "$before_files" = "$(ls -A "$(dirname "$HF")")"
+t "--help に使い方がある" bash -c 'hub-reset --help | grep -q -- --handoff'
 
 echo "# install.sh --env: README"
 I="$T/sample-env"
