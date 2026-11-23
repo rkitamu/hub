@@ -87,6 +87,7 @@ hub-reset
 ```sh
 hub-reset         # ワークスペースを全部閉じて、hub.toml の通りに作り直す
 hub-reset todo    # todo ワークスペース（hub.toml の label）だけを作り直す
+hub-reset [<label>...] --handoff "<引き継ぎ文>"   # 立て直したあと、新しい hub エージェントへ引き継ぐ
 
 hub-work start <作業名> --repo <repo> [--todo <id>] [--worktree] [--purpose <目的>] [--request <依頼文>]
 hub-work finish <作業名>   # 記録されたものだけを閉じ、archive へ移す
@@ -98,6 +99,16 @@ hub-check                  # MAP.md・hub.toml・リポジトリ・エージェ�
 ```
 
 `hub.toml` の `session` に書いたセッションのペインで実行する。
+
+### 引き継ぎ（hub-reset --handoff）
+
+`hub-reset --handoff "<引き継ぎ文>"` で、立て直したあとの司令塔へ作業を引き継げる。
+
+```sh
+hub-reset --handoff "目的: ...
+現状: ...
+次の手順: ..."
+```
 
 ### 作業（hub-work）
 
