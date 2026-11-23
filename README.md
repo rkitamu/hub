@@ -89,7 +89,7 @@ hub-reset
 hub-reset         # ワークスペースを全部閉じて、hub.toml の通りに作り直す
 hub-reset todo    # todo ワークスペース（hub.toml の label）だけを作り直す
 hub-reset [<label>...] --handoff "<引き継ぎ文>"   # 立て直したあと、新しい hub エージェントへ引き継ぐ
-hub-reset [<label>...] --resume                  # hub エージェントだけ同じセッションで起動し直す
+hub-reset [<label>...] --resume   # セッションを復帰して立て直す
 
 hub-work start <作業名> --repo <repo> [--todo <id>] [--worktree] [--purpose <目的>] [--request <依頼文>]
 hub-work finish <作業名>   # 記録されたものだけを閉じ、archive へ移す
@@ -111,14 +111,6 @@ hub-reset --handoff "目的: ...
 現状: ...
 次の手順: ..."
 ```
-
-### 同じセッションへの復帰（hub-reset --resume）
-
-`hub-reset --resume` は、hub エージェントだけを同じセッションで起動し直す。他のエージェントは新規に起動する。同じ会話の続きなので、新しい rules は適用されない。rules を反映したいときは `--resume` なしで立て直す。
-
-- セッション ID は、`hub-reset` が hub エージェントに渡す設定の SessionStart フック（`hub-session-record`）が `$XDG_STATE_HOME/hub/envs/<環境>-<ハッシュ>/hub-session.json` に記録する。設定は `agent-settings.json` に記録フックを足して生成する。
-- この機能を入れる前に起動した hub の ID は記録されていない。一度 `--resume` なしの `hub-reset` で起動すると使える。
-- ID や履歴が無いときは、何も閉じずに止まる。`--handoff` とは同時に指定できない。
 
 ### 作業（hub-work）
 
