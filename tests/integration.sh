@@ -332,8 +332,7 @@ t "信頼済みのリポジトリで worktree の作業を始める" hub-work st
 t "worktree が信頼済みになる" trusted "$RE/.hub-worktrees/trusta/app"
 t "他の設定を保つ" jq -e '.keep == 1' "$CJ"
 A="$T/argv/app.argv"
-t "作業ブランチの push を許可" grep -qxF 'Bash(git push -u origin work/trusta)' "$A"
-tn "push 全体は許可しない" grep -qxF 'Bash(git push:*)' "$A"
+tn "git と gh の自動許可を持たない" grep -qE '^Bash\((git|gh) ' "$A"
 t "trusta を片付ける" hub-work finish trusta
 tn "finish で信頼の登録を外す" trusted "$RE/.hub-worktrees/trusta/app"
 mkdir "$E/plainrepo" && git -C "$E/plainrepo" init -q -b main && git -C "$E/plainrepo" commit -q --allow-empty -m init

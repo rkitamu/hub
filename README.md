@@ -166,9 +166,9 @@ agents = ["todo"]
 
 反映されるのは、次に起動したエージェントから。`setup` のスクリプトが自分で起動するエージェントには自動では届かないので、スクリプト側で環境変数 `HUB_CLAUDE_ARGS`（シェル用に引用済み）を claude の引数に足す。
 
-### hub-commit-guard（main / master へのコミットを拒否するフック）
+### hub-commit-guard（main / master への変更と履歴の書き換えを拒否するフック）
 
-Bash のコマンドを解析し、main / master への `git commit` を拒否する。`git -C`・`--git-dir`・`GIT_DIR=`・`cd`・複合コマンド・サブシェル・`$(...)`・`bash -c`・`eval`・`env` / `sudo` / `xargs` / `find -exec`・git のエイリアスを辿る。`git switch -c x && git commit` は切り替え先で判定する。スクリプトファイルの中身と、実行時に組み立てられる文字列は辿らない。判定できないときは拒否する。
+Bash のコマンドを解析し、main / master への `git commit` と `git push`、force push、`git commit --amend` を拒否する。`git -C`・`--git-dir`・`GIT_DIR=`・`cd`・複合コマンド・サブシェル・`$(...)`・`bash -c`・`eval`・`env` / `sudo` / `xargs` / `find -exec`・git のエイリアスを辿る。`git switch -c x && git commit` は切り替え先で判定する。スクリプトファイルの中身と、実行時に組み立てられる文字列は辿らない。判定できないときは拒否する。
 
 `--allow <パス>` で、指定したリポジトリを対象から除外できる。これは誤操作の防止であり、セキュリティの境界ではない。
 

@@ -112,15 +112,11 @@ def status_path(wd: Path, name: str) -> Path:
 # ── 組み立て（start と resume で共通。あるものは作らない） ───────────
 
 
-def work_access_args(doc_dir: Path, branch: str | None = None) -> list[str]:
-    """作業のディレクトリへの書き込みと、worktree なら作業ブランチへの push までを許す claude の引数。"""
+def work_access_args(doc_dir: Path) -> list[str]:
+    """その作業のディレクトリだけに読み書きを許す claude の引数。"""
     d = str(doc_dir)
     # NOTE: --add-dir は別リポジトリの信頼確認で止まり、work 全体の信頼を求めるので使わない。
     tools = [f"Read(/{d}/**)", f"Edit(/{d}/**)", f"Write(/{d}/**)"]
-    if branch:
-        # NOTE: push は作業ブランチを名指しした形だけを許す。main や force push は確認に回る。
-        tools += ["Bash(git add:*)", "Bash(git commit:*)", f"Bash(git push -u origin {branch})",
-                  f"Bash(git push origin {branch})", "Bash(gh pr create:*)"]
     return ["--allowedTools", *tools]
 
 
@@ -140,10 +136,10 @@ def register_trust(env: Path, name: str, wt: dict) -> None:
         print(f"warning: worktree を信頼済みにできませんでした: {e}", file=sys.stderr)
 
 
-def start_agent(agent: dict, pane: str, launch: list[str], doc_dir: Path, branch: str | None = None) -> None:
+def start_agent(agent: dict, pane: str, launch: list[str], doc_dir: Path) -> None:
     kind = agent.get("kind", "claude")
     cmd = ["agent", "start", agent["name"], "--kind", kind, "--pane", pane]
-    if args := agent_argv(kind, launch, [], work_access_args(doc_dir, branch)):
+    if args := agent_argv(kind, launch, [], work_access_args(doc_dir)):
         cmd += ["--", *args]
     deadline = time.monotonic() + 30
     while True:
@@ -210,7 +206,7 @@ def ensure(env: Path, meta: dict, doc_dir: Path) -> list[str]:
         wt = worktrees.get(agent["repo"])
         if wt and agent.get("kind", "claude") == "claude":
             register_trust(env, doc_dir.name, wt)
-        start_agent(agent, pane, launch, doc_dir, wt["branch"] if wt else None)
+        start_agent(agent, pane, launch, doc_dir)
         started.append(agent["name"])
     return started
 
@@ -224,10 +220,7 @@ def brief(env: Path, name: str, path: Path, request: str | None, meta: dict) -> 
              "止まったら blocked にします。そのあと herdr agent prompt hub \"<作業名と要約>\" で司令塔へ通知してください。"
              "通知が agent_blocked などで拒否されたら、少し待って再送してください。"
              "timeout の場合は届いた可能性があるので、herdr agent read hub で確かめてから再送してください。"
-             f"\n作業ブランチ work/{name} へのコミット、push（git push -u origin work/{name}）、PR 作成まで行ってください。"
-             "この範囲はユーザーの承認済みです。remote が無ければコミットまでで構いません。"
-             + ("" if meta["worktrees"] else f"main / master にいるときは、先に work/{name} を切ってください。")
-             + "main / master への直接のコミットと push、PR のマージ、rebase、force push はしないでください。")
+             "\nコミットや PR は、環境の rules に従ってください。")
     if any((env / r).resolve() == (env / "hub-env").resolve() for r in meta["repos"]):
         rules += ("\nhub-env の CLAUDE.md は司令塔向けですが、あなたは司令塔ではなく、この作業の担当です。"
                   "worktree の中のファイルを変更してください。")
