@@ -1,0 +1,10 @@
+#!/bin/sh
+# main / master への直接コミット（マージコミットを含む）を拒否する。
+branch=$(git symbolic-ref -q --short HEAD)
+case "$branch" in
+main | master)
+  echo "pre-commit: $branch への直接コミットは拒否しました。作業ブランチを切って PR を介してください" >&2
+  exit 1
+  ;;
+esac
+exit 0
