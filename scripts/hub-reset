@@ -30,6 +30,7 @@ import shlex
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 import uuid
 from pathlib import Path
@@ -45,6 +46,10 @@ HUB_AGENT = "hub"
 HANDOFF_MAX_BYTES = 100_000
 # 信頼確認などにユーザーが答えられるよう待つ秒数。テストでは環境変数 HUB_RESET_HANDOFF_WAIT で短くする。
 HANDOFF_WAIT = 180.0
+# timeout の後に、引き継ぎ文が hub の画面に出るのを待つ秒数。テストでは環境変数 HUB_RESET_SCREEN_WAIT で短くする。
+SCREEN_WAIT = 5.0
+# エージェントの起動が失敗したとき、再試行を続ける秒数
+START_RETRY = 10.0
 HANDOFF_PREAMBLE = ("これは hub-reset 前の司令塔からの引き継ぎです。前のセッションの許可は引き継がれていません。"
                     "確認が必要な操作は、改めてユーザーに確認してください。")
 
@@ -52,6 +57,7 @@ ENV_DIR: Path  # main() で決める
 LAUNCH: list[str] = []  # main() で決める。全エージェントに渡す claude の引数
 HUB_LAUNCH: list[str] | None = None  # main() で決める。hub エージェントに LAUNCH の代わりに渡す引数
 RESUME_ARGS: list[str] = []  # main() で決める。hub エージェントにだけ足す引数
+STARTING: list[threading.Thread] = []  # 起動を待っているエージェント。wait_agents() で待つ
 
 
 # ── 設定 ───────────────────────────────────────────────────────
@@ -92,6 +98,13 @@ def check_config(cfg: dict) -> None:
 
 
 # ── 組み立て ───────────────────────────────────────────────────
+
+
+def env_seconds(name: str, default: float) -> float:
+    try:
+        return float(os.environ.get(name) or default)
+    except ValueError:
+        return default
 
 
 def build_tab(tab: dict, root_pane: str, root_cwd: Path, agents: list) -> None:
@@ -143,36 +156,65 @@ def create_workspace(ws: dict, agents: list) -> tuple[str, list[str]]:
     return ws_id, tabs
 
 
-def start_agents(agents: list) -> None:
-    for pane, ag in agents:
-        name = ag["name"]
-        cmd = ["agent", "start", name, "--kind", ag.get("kind", "claude"), "--pane", pane]
-        is_hub = name == HUB_AGENT and ag.get("kind", "claude") == "claude"
-        launch = HUB_LAUNCH if is_hub and HUB_LAUNCH is not None else LAUNCH
-        if args := agent_argv(ag.get("kind", "claude"), launch, ag.get("args", []), RESUME_ARGS if is_hub else None):
-            cmd += ["--", *args]
-        for _ in range(10):
-            if subprocess.run(["herdr", *cmd], capture_output=True).returncode == 0:
-                break
-            # 起動はしたが確認ダイアログ（初回のフォルダ信頼など）で止まっている場合は、ユーザーに任せる
-            st = herdr("agent", "get", name, check=False).get("result", {}).get("agent", {})
-            if st.get("pane_id") == pane and st.get("agent_status") == "blocked":
-                print(f"note: {name} が確認待ちです（初回のフォルダ信頼など）。そのタブで答えてください", file=sys.stderr)
-                break
-            time.sleep(1)
-        else:
+def start_agent(pane: str, ag: dict) -> None:
+    name = ag["name"]
+    cmd = ["agent", "start", name, "--kind", ag.get("kind", "claude"), "--pane", pane]
+    is_hub = name == HUB_AGENT and ag.get("kind", "claude") == "claude"
+    launch = HUB_LAUNCH if is_hub and HUB_LAUNCH is not None else LAUNCH
+    if args := agent_argv(ag.get("kind", "claude"), launch, ag.get("args", []), RESUME_ARGS if is_hub else None):
+        cmd += ["--", *args]
+    deadline = time.monotonic() + START_RETRY
+    while True:
+        if subprocess.run(["herdr", *cmd], capture_output=True).returncode == 0:
+            return
+        # 起動はしたが確認ダイアログ（初回のフォルダ信頼など）で止まっている場合は、ユーザーに任せる
+        st = herdr("agent", "get", name, check=False).get("result", {}).get("agent", {})
+        if st.get("pane_id") == pane and st.get("agent_status") == "blocked":
+            print(f"note: {name} が確認待ちです（初回のフォルダ信頼など）。そのタブで答えてください", file=sys.stderr)
+            return
+        if time.monotonic() > deadline:
             print(f"warning: エージェント {name} の起動に失敗しました（pane {pane}）", file=sys.stderr)
+            return
+        time.sleep(0.2)
+
+
+def start_agents(agents: list) -> None:
+    """エージェントの起動を裏で始める。herdr の起動の確認には数秒かかるので、次のワークスペースの組み立てと重ねる。"""
+    for pane, ag in agents:
+        th = threading.Thread(target=start_agent, args=(pane, ag))
+        th.start()
+        STARTING.append(th)
+
+
+def wait_agents() -> None:
+    while STARTING:
+        STARTING.pop().join()
+
+
+def begin_setup(ws: dict) -> subprocess.Popen:
+    """setup のスクリプトを始め、ワークスペースができるか終わるまで待つ。残り（エージェントの起動など）は裏で続く。
+
+    スクリプトは ws の label でワークスペースを作る。できるまで待つのは、サイドバーの並び順を hub.toml の順に保つため。
+    """
+    p = subprocess.Popen([str(ws["_setup"])], cwd=ws["_cwd"], stdin=subprocess.DEVNULL,
+                         env={**os.environ, "HUB_ENV_DIR": str(ENV_DIR), "HUB_WORKSPACE_LABEL": ws["label"],
+                              "HUB_CLAUDE_ARGS": shlex.join(LAUNCH)})
+    while p.poll() is None and not any(w["label"] == ws["label"] for w in workspaces()):
+        time.sleep(0.1)
+    return p
+
+
+def finish_setup(ws: dict, p: subprocess.Popen) -> None:
+    """setup の終わりを待ち、ワークスペースができたことを確かめる。"""
+    if (rc := p.wait()) != 0:
+        raise ResetError(f"ワークスペース {ws['label']} の setup が失敗しました（exit {rc}）: {ws['_setup']}")
+    if not any(w["label"] == ws["label"] for w in workspaces()):
+        raise ResetError(f"setup の後にワークスペース {ws['label']} がありません。スクリプトの label と hub.toml を揃えてください")
 
 
 def run_setup(ws: dict) -> None:
-    """setup のスクリプトでワークスペースを組み立てる。スクリプトは ws の label でワークスペースを作る。"""
-    p = subprocess.run([str(ws["_setup"])], cwd=ws["_cwd"], stdin=subprocess.DEVNULL,
-                       env={**os.environ, "HUB_ENV_DIR": str(ENV_DIR), "HUB_WORKSPACE_LABEL": ws["label"],
-                            "HUB_CLAUDE_ARGS": shlex.join(LAUNCH)})
-    if p.returncode != 0:
-        raise ResetError(f"ワークスペース {ws['label']} の setup が失敗しました（exit {p.returncode}）: {ws['_setup']}")
-    if not any(w["label"] == ws["label"] for w in workspaces()):
-        raise ResetError(f"setup の後にワークスペース {ws['label']} がありません。スクリプトの label と hub.toml を揃えてください")
+    """setup のスクリプトでワークスペースを組み立て、終わるまで待つ。"""
+    finish_setup(ws, begin_setup(ws))
 
 
 def close_all_except(keep: str) -> None:
@@ -204,8 +246,9 @@ def reset_all(cfg: dict) -> None:
         first_id, first_tabs = create_workspace(wss[0], agents)
     # 2. それ以外を全部閉じる（古いエージェントの名前もここで空く）
     close_all_except(first_id)
-    # 3. hub.toml の順に作る（作った順にサイドバーへ並ぶ）
+    # 3. hub.toml の順に作る（作った順にサイドバーへ並ぶ）。エージェントの起動と setup の残りは裏で続け、最後に待つ
     start_agents(agents)
+    setups: list[tuple[dict, subprocess.Popen]] = []
     for i, ws in enumerate(wss):
         if i == 0 and not placeholder:
             print(f"{ws['label']} を作りました")
@@ -213,10 +256,20 @@ def reset_all(cfg: dict) -> None:
         agents = []
         try:
             if ws.get("_setup"):
-                run_setup(ws)
-            else:
-                create_workspace(ws, agents)
-                start_agents(agents)
+                setups.append((ws, begin_setup(ws)))
+                continue
+            create_workspace(ws, agents)
+            start_agents(agents)
+        except ResetError as e:
+            # 1 つの失敗で、残りのワークスペースまで失わない
+            print(f"error: {e}", file=sys.stderr)
+            failed.append(ws["label"])
+            continue
+        print(f"{ws['label']} を作りました")
+    wait_agents()
+    for ws, p in setups:
+        try:
+            finish_setup(ws, p)
         except ResetError as e:
             # 1 つの setup の失敗で、残りのワークスペースまで失わない
             print(f"error: {e}", file=sys.stderr)
@@ -284,6 +337,7 @@ def reset_some(cfg: dict, labels: list[str]) -> None:
                 herdr("tab", "close", t)
         start_agents(agents)
         print(f"{label} を作り直しました")
+    wait_agents()
 
 
 # ── 引き継ぎ ───────────────────────────────────────────────────
@@ -369,13 +423,15 @@ def send_handoff(body: str) -> str:
 
 
 def seen_on_screen(marker: str) -> bool:
-    for _ in range(5):
+    deadline = time.monotonic() + env_seconds("HUB_RESET_SCREEN_WAIT", SCREEN_WAIT)
+    while True:
         p = subprocess.run(["herdr", "agent", "read", HUB_AGENT, "--source", "recent-unwrapped", "--lines", "400"],
                            capture_output=True, text=True)
         if p.returncode == 0 and marker in p.stdout:
             return True
-        time.sleep(1)
-    return False
+        if time.monotonic() > deadline:
+            return False
+        time.sleep(0.2)
 
 
 def deliver_handoff(path: Path, old_terminal: str | None) -> bool:
@@ -389,10 +445,7 @@ def deliver_handoff(path: Path, old_terminal: str | None) -> bool:
     except (OSError, UnicodeDecodeError) as e:
         return give_up(f"読めません: {type(e).__name__}")
     marker = body.split("\n", 1)[0]
-    try:
-        wait = float(os.environ.get("HUB_RESET_HANDOFF_WAIT") or HANDOFF_WAIT)
-    except ValueError:
-        wait = HANDOFF_WAIT
+    wait = env_seconds("HUB_RESET_HANDOFF_WAIT", HANDOFF_WAIT)
     deadline = time.monotonic() + wait
     noted = False
     while True:
