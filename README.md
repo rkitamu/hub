@@ -169,14 +169,13 @@ agents = ["todo"]
 
 ### hub-commit-guard（git フックを飛ばす操作を拒否するフック）
 
-Bash のコマンドを解析し、git フックを飛ばす次の操作を拒否する。
+Bash のコマンド文字列を調べ、git フックを飛ばす次のものを含めば拒否する。
 
-- `--no-verify`（`git commit`・`push`・`merge`・`pull`・`rebase`・`am` など）と `git commit -n`
-- `git -c core.hooksPath=…` と `git --config-env=core.hooksPath=…`
-- 環境変数 `GIT_CONFIG_PARAMETERS` / `GIT_CONFIG_KEY_<n>` での `core.hooksPath` の指定
-- `git config` による `core.hooksPath` の設定・削除（読むだけなら許可）
+- `--no-verify`
+- `git commit -n`（`-an` のような束ねを含む）
+- `core.hooksPath`（`-c`・`--config-env`・`GIT_CONFIG_*`・`git config` による指定）。`git config --get core.hooksPath` のように読むだけなら許可する
 
-`git -C`・`cd`・複合コマンド・サブシェル・`$(...)`・`bash -c`・`eval`・`env` / `sudo` / `xargs` / `find -exec`・git のエイリアスを辿る。スクリプトファイルの中身と、実行時に組み立てられる文字列は辿らない。これは誤操作の防止であり、セキュリティの境界ではない。
+文字列の検査なので、コミットメッセージ中の文字列なども拒否する。これは誤操作の防止であり、セキュリティの境界ではない。
 
 main / master への直接コミットや push は止めない。それは各リポジトリの git フックで止める。
 
