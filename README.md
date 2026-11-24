@@ -188,13 +188,14 @@ main / master への直接コミットや push は止めない。それは各リ
 ## テスト
 
 ```sh
-python3 tests/test_hub_guard.py          # hub-guard の単体テスト
-python3 tests/test_hub_commit_guard.py   # hub-commit-guard の単体テスト
-python3 tests/test_hub_session_record.py # hub-session-record の単体テスト
-tests/integration.sh              # 一時ディレクトリの環境と専用の herdr サーバーで通しのテスト
+tests/run.sh small    # 単体テスト
+tests/run.sh medium   # 結合テスト
+tests/run.sh          # 両方
 ```
 
-`integration.sh` は `XDG_CONFIG_HOME` ごと一時ディレクトリへ移して専用サーバーを立て、実際のセッションには触らない。
+- small: `tests/test_hub_*.py`。フック（hub-guard・hub-commit-guard・hub-session-record）の単体テスト。
+- medium: `tests/integration.sh`。一時ディレクトリの環境と専用の herdr サーバーで、hub のコマンドを通しで試す。実際のセッションには触らない。
+- large: 本物の Claude や実際のセッションでの確認。`run.sh` の対象外で、手で行う。
 
 ## ライセンス
 
