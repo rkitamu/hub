@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""main / master への Claude の git commit を拒否する PreToolUse フック（Bash 用）。
+"""main / master への git commit と git push、force push、git commit --amend を拒否する PreToolUse フック（Bash 用）。
 
 usage: hub-commit-guard [--allow <リポジトリ>]…
 
@@ -8,7 +8,7 @@ git merge と git merge --continue は止めない（remote の無いリポジ�
 Bash のコマンドを実行せずに解析し、git -C・--git-dir・GIT_DIR=・cd・複合コマンド・サブシェル・
 $(...)・bash -c・eval・env / sudo / xargs / find -exec・git のエイリアスを辿る。
 `git switch -c x && git commit` のように && でつながった切り替えは、切り替え先のブランチで判定する。
-コミット先を判定できないときは拒否する（exit 2）。
+コミット先や push 先を判定できないときは拒否する（exit 2）。
 
 対象外: スクリプトファイルの中身、実行時に決まる文字列の組み立て、Bash 以外の経路。
 誤操作の防止であり、セキュリティの境界ではない。
@@ -38,6 +38,12 @@ WRAPPERS: dict[str, set[str]] = {
     "xargs": {"-I", "-n", "-P", "-L", "-d", "-E", "-s", "-a"},
     "timeout": {"-s", "-k"},
 }
+# git commit で次の語を値として取るオプション（--amend と見間違えないため）
+COMMIT_VALUE_OPTS = {"-m", "-F", "-C", "-c", "-t", "--message", "--file", "--reuse-message", "--reedit-message", "--template",
+                     "--author", "--date", "--fixup", "--squash", "--trailer", "--cleanup", "--pathspec-from-file"}
+PUSH_VALUE_OPTS = {"--repo", "--exec", "--receive-pack", "--push-option"}
+PUSH_FORCE_OPTS = ("--force", "--force-with-lease", "--force-if-includes")
+PUSH_ALL_OPTS = ("--mirror", "--all", "--branches")
 GIT_VALUE_OPTS = {"--git-dir", "--work-tree", "--namespace", "--config-env", "--super-prefix"}
 # エイリアスを調べなくてよい、よく使うサブコマンド
 GIT_BUILTINS = {"status", "add", "diff", "log", "show", "fetch", "pull", "push", "branch", "rev-parse", "remote", "stash",
@@ -387,7 +393,7 @@ class Guard:
         args = words[1:]
 
         if UNKNOWN in words[0]:  # $GIT commit のように、実行時に決まるコマンド
-            if "commit" in args:
+            if "commit" in args or "push" in args:
                 self.git(args, st, item, temp, depth)
             return
         if name == "git":
@@ -467,7 +473,7 @@ class Guard:
         for i, a in enumerate(args):
             if a.startswith("-") and not a.startswith("--") and "c" in a:
                 if i + 1 < len(args):
-                    if UNKNOWN in args[i + 1] and "commit" in args[i + 1]:
+                    if UNKNOWN in args[i + 1] and ("commit" in args[i + 1] or "push" in args[i + 1]):
                         raise Denied("bash -c の中身を判定できません")
                     self.run_text(args[i + 1], self.with_temp(st, temp), depth)
                 return
@@ -525,12 +531,16 @@ class Guard:
         ctx = (cwd, opts, env)
 
         if UNKNOWN in sub:
+            if "push" in rest:
+                raise Denied(f"git {sub} の push 先を判定できません")
             if "commit" in rest or not rest:
-                self.check_commit(ctx, st, f"git {sub}")
+                self.check_commit(ctx, st, f"git {sub}", self.has_amend(rest))
             return
         if sub == "commit":
             if "--dry-run" not in rest and "-h" not in rest and "--help" not in rest:
-                self.check_commit(ctx, st, "git commit")
+                self.check_commit(ctx, st, "git commit", self.has_amend(rest))
+        elif sub == "push":
+            self.check_push(rest, ctx, st)
         elif sub in ("switch", "checkout"):
             self.track_switch(sub, rest, ctx, st, item)
         elif sub not in GIT_BUILTINS:
@@ -569,7 +579,24 @@ class Guard:
             raise Denied("git のエイリアスが深すぎて判定できません")
         self.git([*opts, *words, *rest], inner, item, temp, depth + 1)
 
-    def check_commit(self, ctx: tuple, st: State, what: str) -> None:
+    @staticmethod
+    def has_amend(rest: list[str]) -> bool:
+        amend = False
+        i = 0
+        while i < len(rest):
+            a = rest[i]
+            i += 1
+            if a == "--":
+                break
+            if a in COMMIT_VALUE_OPTS:
+                i += 1
+            elif len(a) >= 4 and "--amend".startswith(a):  # git は一意な省略形を受け付ける
+                amend = True
+            elif a == "--no-amend":
+                amend = False
+        return amend
+
+    def check_commit(self, ctx: tuple, st: State, what: str, amend: bool = False) -> None:
         cwd, opts, _ = ctx
         if cwd is None or any(UNKNOWN in o for o in opts):
             raise Denied(f"{what} のコミット先を判定できません。cd や -C には実際のパスを書いてください")
@@ -581,12 +608,128 @@ class Guard:
         top = self.git_out(ctx, "rev-parse", "--show-toplevel")
         if top and Path(top).resolve() in self.allow:
             return
+        if amend:
+            raise Denied(f"git commit --amend は拒否しました（{top or gitdir}）。新しいコミットを追加してください")
         branch = st.override.get(gitdir)
         if branch is None:
             branch = self.git_out(ctx, "symbolic-ref", "-q", "--short", "HEAD") or ""
         if branch in PROTECTED:
             raise Denied(f"{branch} への git commit は拒否しました（{top or gitdir}）。"
                          "git switch -c <作業ブランチ> で作業ブランチを切ってからコミットしてください")
+
+    def check_push(self, rest: list[str], ctx: tuple, st: State) -> None:
+        if "-h" in rest or "--help" in rest:
+            return
+        positional: list[str] = []
+        repo: str | None = None
+        dry = tags = only_args = False
+        bad: str | None = None
+        i = 0
+        while i < len(rest):
+            a = rest[i]
+            i += 1
+            if only_args or a == "-" or not a.startswith("-"):
+                positional.append(a)
+            elif a == "--":
+                only_args = True
+            elif UNKNOWN in a:
+                raise Denied("git push のオプションを判定できません")
+            elif a.startswith("--"):
+                name = a.split("=", 1)[0]
+                if name in PUSH_VALUE_OPTS:
+                    value = a.split("=", 1)[1] if "=" in a else (rest[i] if i < len(rest) else "")
+                    i += 0 if "=" in a else 1
+                    if name == "--repo":
+                        repo = value
+                elif len(name) >= 5 and any(f.startswith(name) for f in PUSH_FORCE_OPTS):
+                    bad = "force push"
+                elif len(name) >= 4 and any(f.startswith(name) for f in PUSH_ALL_OPTS):
+                    bad = f"git push {name}"
+                elif name == "--dry-run":
+                    dry = True
+                elif name == "--no-dry-run":
+                    dry = False
+                elif name == "--tags":
+                    tags = True
+            else:
+                for j, c in enumerate(a[1:], 1):
+                    if c == "f":
+                        bad = "force push"
+                    elif c == "n":
+                        dry = True
+                    elif c == "o":  # 値を取る。-ofoo は残りが値
+                        i += 1 if j == len(a) - 1 else 0
+                        break
+        if dry:
+            return
+        cwd, opts, _ = ctx
+        if cwd is None or any(UNKNOWN in o for o in opts):
+            raise Denied("git push の対象を判定できません。cd や -C には実際のパスを書いてください")
+        if not cwd.is_dir():
+            return  # git 自身が失敗する
+        gitdir = self.git_out(ctx, "rev-parse", "--absolute-git-dir")
+        if gitdir is None:
+            return  # リポジトリの外
+        top = self.git_out(ctx, "rev-parse", "--show-toplevel")
+        if top and Path(top).resolve() in self.allow:
+            return
+        where = top or gitdir
+        if bad:
+            raise Denied(f"{bad} は拒否しました（{where}）")
+        if any(UNKNOWN in a for a in positional) or (repo and UNKNOWN in repo):
+            raise Denied("git push の宛先を判定できません")
+        branch = st.override.get(gitdir)
+        if branch is None:
+            branch = self.git_out(ctx, "symbolic-ref", "-q", "--short", "HEAD") or ""
+
+        def config(key: str) -> str | None:
+            return self.git_out(ctx, "config", "--get", key) or None
+
+        remote = (positional[0] if positional else repo) or (branch and config(f"branch.{branch}.pushRemote")) \
+            or config("remote.pushDefault") or (branch and config(f"branch.{branch}.remote")) or "origin"
+        if (config(f"remote.{remote}.mirror") or "").lower() in ("true", "yes", "on", "1"):
+            raise Denied(f"mirror の remote への git push は拒否しました（{where}）")
+        configured = (self.git_out(ctx, "config", "--get-all", f"remote.{remote}.push") or "").split()
+        refspecs = positional[1:]
+        for spec in refspecs:
+            self.check_refspec(spec, branch, where)
+        if refspecs:
+            # NOTE: コロンの無い refspec は、remote.<name>.push で別の宛先へ写されることがある。
+            if any(":" not in s for s in refspecs):
+                for spec in configured:
+                    self.check_refspec(spec, branch, where)
+            return
+        if tags:
+            return
+        if configured:
+            for spec in configured:
+                self.check_refspec(spec, branch, where)
+            return
+        mode = config("push.default") or "simple"
+        if mode == "nothing":
+            return
+        if mode == "matching":
+            raise Denied(f"push.default=matching の git push は main / master を含むので拒否しました（{where}）")
+        if branch in PROTECTED:
+            raise Denied(f"{branch} への git push は拒否しました（{where}）")
+        if mode in ("upstream", "tracking") and branch:
+            self.check_refspec(f"{branch}:{config(f'branch.{branch}.merge') or branch}", branch, where)
+
+    @staticmethod
+    def check_refspec(spec: str, branch: str, where: str) -> None:
+        if spec.startswith("+"):
+            raise Denied(f"force push（{spec}）は拒否しました（{where}）")
+        src, sep, dst = spec.partition(":")
+        if sep and not src and not dst:
+            raise Denied(f"git push の : は main / master を含むので拒否しました（{where}）")
+        dst = dst or src
+        if dst in ("HEAD", "@"):
+            dst = branch
+        if "*" in dst:
+            raise Denied(f"ワイルドカードの git push（{spec}）は拒否しました（{where}）")
+        name = dst.removeprefix("refs/heads/").removeprefix("heads/") if dst.startswith(("refs/heads/", "heads/")) else dst
+        if name in PROTECTED:
+            raise Denied(f"{name} への git push は拒否しました（{where}）")
 
     def track_switch(self, sub: str, rest: list[str], ctx: tuple, st: State, item: Cmd) -> None:
         cwd, opts, _ = ctx
@@ -648,7 +791,7 @@ def check(payload: dict, allow: list[Path]) -> str | None:
         return str(e)
     except Exception as e:
         # 解析できなくても、git に関係なさそうなコマンドまでは止めない
-        if "git" in command or "commit" in command:
+        if "git" in command or "commit" in command or "push" in command:
             return f"コマンドを解析できないので拒否します: {e}"
     return None
 

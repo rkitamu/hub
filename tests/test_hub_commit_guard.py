@@ -189,6 +189,82 @@ class CommitGuardTest(unittest.TestCase):
         p = subprocess.run([str(GUARD)], input=json.dumps(payload), capture_output=True, text=True, env=ENV)
         self.assertEqual(p.returncode, 2, "cwd が無いと判定できない")
 
+    def test_amend(self):
+        for cmd in ("git commit --amend", "git commit --amend --no-edit -m x", "git commit --amen", "git -c a.b=c commit --amend",
+                    "bash -c 'git commit --amend'", "git add . && git commit --amend"):
+            self.deny(cmd, cwd=self.feat)
+        sh(self.feat, "config", "alias.fix", "commit --amend")
+        self.deny("git fix", cwd=self.feat)
+        for cmd in ("git commit -m --amend", "git commit --amend --no-amend -m x", "git commit --amend --dry-run",
+                    "git commit -m x -- --amend"):
+            self.allow(cmd, cwd=self.feat)
+
+    def test_push_to_protected(self):
+        for cmd in ("git push origin main", "git push origin master", "git push origin HEAD:main", "git push origin @:main",
+                    "git push origin feature:refs/heads/main", "git push origin refs/heads/main",
+                    "git push origin HEAD:refs/heads/master", "git push origin heads/main", "git push origin :main",
+                    "git push origin --delete main", "git push -d origin main", "git push origin feature main",
+                    "git push origin :", "git push origin 'refs/heads/*:refs/heads/*'", "git push --all", "git push --mirror",
+                    "git push origin -- main", "git -C . push origin main", "env git push origin main",
+                    "bash -c 'git push origin main'", "git add . && git push origin main", 'B=main; git push origin "$B"',
+                    'git push origin "$UNKNOWN_REF_X"'):
+            self.deny(cmd, cwd=self.feat)
+
+    def test_push_current_branch(self):
+        for cmd in ("git push", "git push origin", "git push -u origin", "git push origin HEAD", "git push origin @"):
+            self.deny(cmd)
+            self.deny(cmd, cwd=self.master)
+        for cmd in ("git push", "git push origin", "git push origin HEAD"):
+            self.allow(cmd, cwd=self.feat)
+        self.deny("git switch main && git push", cwd=self.feat)
+        self.allow("git switch -c work && git push -u origin work")
+        self.deny("git switch -c work; git push")
+
+    def test_push_config(self):
+        sh(self.feat, "config", "push.default", "matching")
+        self.deny("git push", cwd=self.feat)
+        self.allow("git push origin feature", cwd=self.feat)
+        sh(self.feat, "config", "push.default", "upstream")
+        sh(self.feat, "config", "branch.feature.merge", "refs/heads/main")
+        self.deny("git push", cwd=self.feat)
+        sh(self.feat, "config", "--unset", "push.default")
+        self.allow("git push", cwd=self.feat)
+        self.deny("git -c push.default=matching push", cwd=self.feat)
+        sh(self.feat, "config", "remote.origin.push", "refs/heads/feature:refs/heads/main")
+        self.deny("git push", cwd=self.feat)
+        self.deny("git push origin feature", cwd=self.feat)
+        sh(self.feat, "config", "--unset", "remote.origin.push")
+        sh(self.feat, "config", "remote.origin.mirror", "true")
+        self.deny("git push", cwd=self.feat)
+
+    def test_force_push(self):
+        for cmd in ("git push -f", "git push -f origin feature", "git push --force origin feature", "git push --forc origin feature",
+                    "git push --force-with-lease", "git push --force-with-lease=feature:abc origin feature",
+                    "git push --force-if-includes origin feature", "git push -uf origin feature", "git push -fu origin feature",
+                    "git push origin +feature", "git push origin +HEAD:feature", "git push origin feature --force"):
+            self.deny(cmd, cwd=self.feat)
+        sh(self.feat, "config", "alias.pf", "push --force")
+        sh(self.feat, "config", "alias.spf", "!git push -f")
+        self.deny("git pf", cwd=self.feat)
+        self.deny("git spf", cwd=self.feat)
+        sh(self.feat, "config", "remote.origin.push", "+refs/heads/feature:refs/heads/feature")
+        self.deny("git push", cwd=self.feat)
+
+    def test_push_allowed(self):
+        for cmd in ("git push origin feature", "git push -u origin feature", "git push --set-upstream origin feature",
+                    "git push origin HEAD:feature", "git push origin feature:refs/heads/feature", "git push origin --delete old",
+                    "git push -o main origin feature", "git push --push-option=main origin feature", "git push --tags",
+                    "git push origin v1.0", "git push --dry-run origin main", "git push -n --force origin main",
+                    "git push --help", "git log --grep=push", "echo 'git push origin main'"):
+            self.allow(cmd, cwd=self.feat)
+        self.allow("git push --tags")
+        self.allow("git push origin main", cwd=self.plain)
+
+    def test_allow_list_covers_push_and_amend(self):
+        for cmd in ("git push", "git push origin main", "git push --force origin main", "git commit --amend"):
+            self.allow(cmd, allow=[self.main])
+            self.deny(cmd, cwd=self.master, allow=[self.main])
+
     def test_unparsable_unrelated_command_passes(self):
         self.allow("echo 'unterminated")
 

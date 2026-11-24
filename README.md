@@ -137,9 +137,9 @@ worktrees: []
 
 作業ディレクトリには、`status.md`（必須）のほかに `runbook.md`（任意。手順・調査メモ・再現方法）と `data/`（任意。検証データ）を置ける。`start` が作るのは `status.md` だけで、`finish` はディレクトリごと `archive/` へ移す。`status.md` と `runbook.md` は自動でコミットされ、`data/` は work の `.gitignore` で除外される（archive 内も同じ。既存のリポジトリにも次の `hub-work` で効く）。秘密情報はどちらにも書かない。
 
-作業エージェントには起動時に `--add-dir` と `--allowedTools` で、その作業のディレクトリへの書き込みだけを許可する。
-
 - `state` は `active` / `blocked` / `done`。front matter の値は JSON で書く（YAML としても読める）。
+- `--repo` には hub-env（`--worktree` と `--request` が必須）と、環境の外のリポジトリ（例: `../src/hub`）も指定できる。
+- 元のリポジトリが信頼済みなら、`--worktree` の worktree も Claude Code の信頼済みフォルダとして扱う。依頼が届かなかったときは、再送のコマンドを表示する。
 - `--worktree` を付けると、`<環境>/.hub-worktrees/<作業名>/<repo>` にブランチ `work/<作業名>` の worktree を作る。herdr の worktree は 1 つが 1 ワークスペースなので、複数リポジトリでは 2 つ目以降が `w-<作業名>--<repo>` になる。
 - `finish` は worktree に未コミットの変更があれば、何も閉じずに止まる。ブランチは消さない。`.gitignore` された未追跡ファイルは未コミットの変更に数えず、worktree と一緒に消える。
 - 作業のワークスペースが他の worktree の親になっているときも、他の作業を巻き込まないよう止まる。
@@ -166,9 +166,9 @@ agents = ["todo"]
 
 反映されるのは、次に起動したエージェントから。`setup` のスクリプトが自分で起動するエージェントには自動では届かないので、スクリプト側で環境変数 `HUB_CLAUDE_ARGS`（シェル用に引用済み）を claude の引数に足す。
 
-### hub-commit-guard（main / master へのコミットを拒否するフック）
+### hub-commit-guard（main / master への変更と履歴の書き換えを拒否するフック）
 
-Bash のコマンドを解析し、main / master への `git commit` を拒否する。`git -C`・`--git-dir`・`GIT_DIR=`・`cd`・複合コマンド・サブシェル・`$(...)`・`bash -c`・`eval`・`env` / `sudo` / `xargs` / `find -exec`・git のエイリアスを辿る。`git switch -c x && git commit` は切り替え先で判定する。スクリプトファイルの中身と、実行時に組み立てられる文字列は辿らない。判定できないときは拒否する。
+Bash のコマンドを解析し、main / master への `git commit` と `git push`、force push、`git commit --amend` を拒否する。`git -C`・`--git-dir`・`GIT_DIR=`・`cd`・複合コマンド・サブシェル・`$(...)`・`bash -c`・`eval`・`env` / `sudo` / `xargs` / `find -exec`・git のエイリアスを辿る。`git switch -c x && git commit` は切り替え先で判定する。スクリプトファイルの中身と、実行時に組み立てられる文字列は辿らない。判定できないときは拒否する。
 
 `--allow <パス>` で、指定したリポジトリを対象から除外できる。これは誤操作の防止であり、セキュリティの境界ではない。
 
