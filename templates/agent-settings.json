@@ -6,7 +6,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "\"{{HUB}}/scripts/hub-commit-guard\" --allow \"{{HUB_ENV}}/work\""
+            "command": "\"{{HUB}}/scripts/hub-commit-guard\""
           }
         ]
       }

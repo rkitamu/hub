@@ -186,8 +186,7 @@ t "rules が無ければ引数を渡さない" no_rules_arg
 mkdir "$E/hub-env/rules"; mv "$T/local.md" "$E/hub-env/rules/local.md"
 t "rules を戻すと引数を渡す" has_rules_arg
 t "雛形の settings が JSON として正しい" jq -e '.hooks.PreToolUse[0].matcher == "Bash"' "$E/hub-env/agent-settings.json"
-t "雛形は work の直接コミットを許可する" bash -c "jq -r '.hooks.PreToolUse[0].hooks[0].command' '$E/hub-env/agent-settings.json' | grep -qF -- '--allow \"$E/hub-env/work\"'"
-tn "雛形は hub-env の直接コミットを許可しない" bash -c "jq -r '.hooks.PreToolUse[0].hooks[0].command' '$E/hub-env/agent-settings.json' | grep -qF -- '--allow \"$E/hub-env\"'"
+t "雛形は hub-commit-guard を登録する" bash -c "jq -r '.hooks.PreToolUse[0].hooks[0].command' '$E/hub-env/agent-settings.json' | grep -qF -- '$HUB/scripts/hub-commit-guard'"
 cp "$E/hub-env/agent-settings.json" "$T/settings.bak"; echo '{broken' >"$E/hub-env/agent-settings.json"
 tn "壊れた settings ではリセットしない" hub-reset
 t "壊れた settings では何も閉じない" has_agent hub
