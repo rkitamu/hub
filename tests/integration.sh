@@ -3,33 +3,17 @@
 # 使い方: tests/integration.sh [todo-herdr のパス]
 # 実際のセッションに触らないよう、XDG_CONFIG_HOME ごと一時ディレクトリへ移し、ソケットがその中でなければ止まる。
 # setup の確認には同梱の代替スクリプトを使う。todo-herdr のパスを渡すと、そのコピーを使う（元のファイルには触らない）。
+# 互いに状態を共有しないグループごとに、一時ディレクトリと専用の herdr サーバーを作り、並列に実行する。
 set -uo pipefail
 
 HUB="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 TODO_HERDR="${1:-}"
-# NOTE: unix ソケットのパス長の上限があるので、短い場所に作る。
-T="$(mktemp -d /tmp/hubi.XXXXXX)"
 unset HERDR_ENV HERDR_PANE_ID HERDR_TAB_ID HERDR_WORKSPACE_ID HERDR_SOCKET_PATH HERDR_SESSION
-export XDG_CONFIG_HOME="$T/config" XDG_STATE_HOME="$T/state" SHELL=/bin/bash
-# NOTE: hub-work が信頼の登録で本物の ~/.claude.json を書かないよう、設定ごと移す。
-export CLAUDE_CONFIG_DIR="$T/claude"
+export SHELL=/bin/bash
 export GIT_AUTHOR_NAME=t GIT_AUTHOR_EMAIL=t@example.invalid GIT_COMMITTER_NAME=t GIT_COMMITTER_EMAIL=t@example.invalid
-export PATH="$T/bin:$HUB/scripts:$PATH"
-SOCK="$T/config/herdr/sessions/hubtest/herdr.sock"
-mkdir -p "$T/bin" "$T/config/hub" "$T/state" "$T/argv" "$T/claude"
-echo '{"projects":{}}' >"$T/claude/.claude.json"
-export HUB_TEST_ARGV="$T/argv"
 
-cleanup() {
-  if [[ "${HERDR_SOCKET_PATH:-}" == "$T/"* ]]; then herdr server stop >/dev/null 2>&1; fi
-  [[ -n "${SERVER_PID:-}" ]] && kill "$SERVER_PID" 2>/dev/null
-  rm -rf "$T"
-}
-trap cleanup EXIT
-
-pass=0 fail=0
-ok() { pass=$((pass + 1)); echo "ok   - $1"; }
-ng() { fail=$((fail + 1)); echo "FAIL - $1"; }
+ok() { echo "ok   - $1"; }
+ng() { echo "FAIL - $1"; }
 t() { local d="$1"; shift; if "$@" >"$T/out" 2>&1; then ok "$d"; else ng "$d"; sed 's/^/       /' "$T/out"; fi; }
 tn() { local d="$1"; shift; if "$@" >"$T/out" 2>&1; then ng "$d（成功してしまった）"; sed 's/^/       /' "$T/out"; else ok "$d"; fi; }
 has_ws() { herdr workspace list | jq -e --arg l "$1" 'any(.result.workspaces[]; .label == $l)' >/dev/null; }
@@ -38,7 +22,40 @@ has_agent() { herdr agent list | jq -e --arg n "$1" 'any(.result.agents[]; .name
 no_agent() { ! has_agent "$1"; }
 count_ws() { [[ "$(herdr workspace list | jq --arg l "$1" '[.result.workspaces[] | select(.label == $l)] | length')" == "$2" ]]; }
 wait_for() { local i; for i in $(seq 1 50); do "$@" && return 0; perl -e 'select(undef,undef,undef,0.2)'; done; return 1; }
+wait_long() { local i; for i in $(seq 1 300); do "$@" && return 0; perl -e 'select(undef,undef,undef,0.2)'; done; return 1; }
+input_has() { [[ -f "$HI" && "$(cat "$HI")" == *"$1"* ]]; }
+input_count() { [[ "$(grep -c -F -- "$1" "$HI")" == "$2" ]]; }
+ws_id() { herdr workspace list | jq -r --arg l "$1" '.result.workspaces[] | select(.label == $l) | .workspace_id'; }
+tab_ids() { herdr tab list --workspace "$(ws_id "$1")" | jq -c '[.result.tabs[].tab_id]'; }
+# 準備の手順。検査の件数には数えず、失敗したときだけ FAIL を出す
+prep() { if ! "$@" >"$T/prep" 2>&1; then ng "準備: $*"; sed 's/^/       /' "$T/prep"; fi; }
+# 裏で動く hub-reset が終わったか。裏の実行はログを開いたまま動く
+bg_reset_done() { ! fuser -s "$T/state/hub-reset.log" 2>/dev/null; }
 
+cleanup() {
+  if [[ "${HERDR_SOCKET_PATH:-}" == "$T/"* ]]; then herdr server stop >/dev/null 2>&1; fi
+  [[ -n "${SERVER_PID:-}" ]] && kill "$SERVER_PID" 2>/dev/null
+  rm -rf "$T"
+}
+
+# 一時ディレクトリだけを作る
+make_tmp() {
+# NOTE: unix ソケットのパス長の上限があるので、短い場所に作る。
+T="$(mktemp -d /tmp/hubi.XXXXXX)"
+trap cleanup EXIT
+export XDG_CONFIG_HOME="$T/config" XDG_STATE_HOME="$T/state"
+# NOTE: hub-work が信頼の登録で本物の ~/.claude.json を書かないよう、設定ごと移す。
+export CLAUDE_CONFIG_DIR="$T/claude"
+export PATH="$T/bin:$HUB/scripts:$PATH"
+SOCK="$T/config/herdr/sessions/hubtest/herdr.sock"
+mkdir -p "$T/bin" "$T/config/hub" "$T/state" "$T/argv" "$T/claude"
+echo '{"projects":{}}' >"$T/claude/.claude.json"
+export HUB_TEST_ARGV="$T/argv"
+}
+
+# 一時ディレクトリに、偽の claude と環境と専用サーバーを用意する
+make_env() {
+make_tmp
 # ── 偽の claude と環境 ──────────────────────────────────────────
 cat >"$T/bin/claude" <<'EOF'
 #!/bin/bash
@@ -152,6 +169,54 @@ wait_for test -S "$SOCK" || { echo "サーバーが起動しませんでした";
 export HERDR_SOCKET_PATH="$SOCK" HERDR_SESSION=hubtest
 [[ "$HERDR_SOCKET_PATH" == /tmp/hubi.* ]] || { echo "ソケットが一時ディレクトリの外です"; exit 1; }
 wait_for herdr workspace list >/dev/null
+W="$E/hub-env/work"
+HI="$T/argv/hub-env.input"
+}
+
+# hub.toml の先頭を setup のワークスペースにする
+swap_first() {
+python3 - "$E/hub-env/hub.toml" <<'EOF'
+import re, sys
+p = sys.argv[1]; s = p and open(p).read()
+head, *blocks = re.split(r"(?=^\[\[workspace\]\]$)", s, flags=re.M)
+blocks[0], blocks[1] = blocks[1], blocks[0]
+open(p, "w").write(head + "".join(blocks))
+EOF
+}
+
+# --handoff の確認に使う道具。hub-reset の後に呼ぶ
+handoff_tools() {
+R="$(grep -A1 -- '--append-system-prompt-file' "$T/argv/hub-env.argv" | tail -1)"
+HF="$(dirname "$R")/handoff.md"
+REAL_HERDR="$(command -v herdr)"
+mkdir "$T/handoffbin"
+# agent prompt の結果を HANDOFF_STUB で差し替え、呼び出しを数える。全呼び出しの引数と環境も記録する
+cat >"$T/handoffbin/herdr" <<EOF
+#!/bin/bash
+env >>"$T/handoff-env"
+if [[ "\$1 \$2" == "agent prompt" ]]; then
+  echo x >>"$T/handoff-prompts"
+  n="\$(wc -l <"$T/handoff-prompts")"
+  case "\${HANDOFF_STUB:-}" in
+    fail) echo '{"error":{"code":"agent_not_found","message":"x"}}' >&2; exit 1 ;;
+    timeout) echo '{"error":{"code":"timeout","message":"x"}}' >&2; exit 1 ;;
+    sent-timeout) "$REAL_HERDR" "\$@" >/dev/null; echo '{"error":{"code":"timeout","message":"x"}}' >&2; exit 1 ;;
+    blocked) echo '{"error":{"code":"agent_blocked","message":"x"}}' >&2; exit 1 ;;
+    blocked-once) if [[ "\$n" == 1 ]]; then echo '{"error":{"code":"agent_blocked","message":"x"}}' >&2; exit 1; fi ;;
+  esac
+fi
+exec "$REAL_HERDR" "\$@"
+EOF
+chmod +x "$T/handoffbin/herdr"
+hstub() { local mode="$1"; shift; : >"$T/handoff-prompts"; PATH="$T/handoffbin:$PATH" HANDOFF_STUB="$mode" HUB_RESET_HANDOFF_WAIT=3 HUB_RESET_SCREEN_WAIT=1 hub-reset "$@"; }
+prompts_are() { [[ "$(wc -l <"$T/handoff-prompts")" == "$1" ]]; }
+SPECIAL=$'--help -x "二重" \'単一\' $HOME `id` \\back\n二行目 ; rm -rf nope && echo x\n\n  字下げ-固有文字列'
+}
+
+# ── グループ ───────────────────────────────────────────────
+
+group_base() {
+make_env
 herdr workspace create --cwd "$T" --label stale --no-focus >/dev/null
 
 echo "# hub-reset: 全体（setup あり）"
@@ -192,14 +257,6 @@ tn "壊れた settings ではリセットしない" hub-reset
 t "壊れた settings では何も閉じない" has_agent hub
 cp "$T/settings.bak" "$E/hub-env/agent-settings.json"
 
-echo "# hub-reset: 単体（setup あり）"
-old="$(herdr workspace list | jq -r '.result.workspaces[] | select(.label == "todo") | .workspace_id')"
-t "todo だけ作り直せる" hub-reset todo
-new="$(herdr workspace list | jq -r '.result.workspaces[] | select(.label == "todo") | .workspace_id')"
-t "ワークスペースが新しくなる" test "$old" != "$new"
-t "todo は 1 つのまま" count_ws todo 1
-t "todo エージェントが戻る" has_agent todo
-t "他のワークスペースは残る" has_ws app
 
 echo "# hub-work: 検証"
 tn "archive は作業名に使えない" hub-work start archive --repo app
@@ -262,15 +319,6 @@ printf '| `app` | 稼働 | アプリ | - |\n' >"$T/row"
 sed -i "/\`todo\` | 稼働/r $T/row" "$E/hub-env/MAP.md"
 t "check: 直すと通る" hub-check
 
-echo "# hub-reset: worktree がつながった状態"
-t "todo に worktree の作業を始める" hub-work start ttree --repo todo --worktree
-hub-reset todo >"$T/reset" 2>&1; rc=$?
-t "単体リセットは他の作業を巻き込まず止まる（setup + worktree）" test "$rc" -ne 0
-t "止まる理由が worktree のつながり" grep -q 'つながっています' "$T/reset"
-t "止まった後も todo は残る" has_ws todo
-t "止まった後も worktree の作業は残る" has_ws w-ttree
-t "ttree を片付ける" hub-work finish ttree
-
 echo "# hub-work: finish"
 echo x >"$E/.hub-worktrees/tree/app/dirty"
 tn "未コミットの変更があれば止める" hub-work finish tree
@@ -286,7 +334,54 @@ t "archive へ移る" test -f "$W/archive/tree/status.md"
 t "archive の state は done" grep -qx 'state: done' "$W/archive/tree/status.md"
 t "他の作業は残る" has_agent w-plain
 tn "archive 内と同名を拒否する" hub-work start tree --repo app
+echo "# hub-work: resume（hub-reset の後）"
+t "worktree の作業を始める" hub-work start again --repo app --worktree
+t "worktree があっても全体リセットできる" hub-reset
+t "リセットで作業のワークスペースが閉じる" no_ws w-again
+t "リセットしても checkout は残る" test -d "$E/.hub-worktrees/again/app"
+t "worktree の作業を立て直す" hub-work resume again
+t "ワークスペースが戻る" has_ws w-again
+t "エージェントが戻る" has_agent w-again
+t "通常の作業を立て直す" hub-work resume plain
+t "通常の作業のエージェントが戻る" has_agent w-plain
+t "resume は冪等" hub-work resume again
+t "二重に作らない" count_ws w-again 1
+t "again を finish できる" hub-work finish again
+hub-work finish plain >"$T/finish-plain" 2>&1; rc=$?
+t "plain を finish できる" test "$rc" -eq 0
+t "finish が棚卸しを促す" grep -q '棚卸し' "$T/finish-plain"
+t "runbook.md も archive へ移る" test -f "$W/archive/plain/runbook.md"
+t "data/ も archive へ移る" test -f "$W/archive/plain/data/x.csv"
+t "runbook.md はコミットされる" git -C "$W" ls-files --error-unmatch archive/plain/runbook.md
+tn "data/ はコミットされない" git -C "$W" ls-files --error-unmatch archive/plain/data/x.csv
+t "plain のワークスペースが閉じる" no_ws w-plain
+t "作業文書がコミットされる" bash -c "git -C '$W' log --oneline | grep -q 'finish plain'"
+}
 
+group_ttree() {
+make_env
+prep hub-reset
+echo "# hub-reset: 単体（setup あり）"
+old="$(herdr workspace list | jq -r '.result.workspaces[] | select(.label == "todo") | .workspace_id')"
+t "todo だけ作り直せる" hub-reset todo
+new="$(herdr workspace list | jq -r '.result.workspaces[] | select(.label == "todo") | .workspace_id')"
+t "ワークスペースが新しくなる" test "$old" != "$new"
+t "todo は 1 つのまま" count_ws todo 1
+t "todo エージェントが戻る" has_agent todo
+t "他のワークスペースは残る" has_ws app
+echo "# hub-reset: worktree がつながった状態"
+t "todo に worktree の作業を始める" hub-work start ttree --repo todo --worktree
+hub-reset todo >"$T/reset" 2>&1; rc=$?
+t "単体リセットは他の作業を巻き込まず止まる（setup + worktree）" test "$rc" -ne 0
+t "止まる理由が worktree のつながり" grep -q 'つながっています' "$T/reset"
+t "止まった後も todo は残る" has_ws todo
+t "止まった後も worktree の作業は残る" has_ws w-ttree
+t "ttree を片付ける" hub-work finish ttree
+}
+
+group_parent() {
+make_env
+prep hub-reset
 echo "# hub-work: 親になったワークスペース"
 mkdir "$E/solo" && git -C "$E/solo" init -q -b main && git -C "$E/solo" commit -q --allow-empty -m init
 t "solo で通常の作業を始める" hub-work start psolo --repo solo
@@ -306,7 +401,11 @@ t "親が status.md に記録される" grep -q '"source"' "$W/auto/status.md"
 t "finish できる" hub-work finish auto
 t "自動で作られた親も閉じる" no_ws solo
 rm -rf "$E/solo"
+}
 
+group_blocked() {
+make_env
+prep hub-reset
 echo "# hub-work: 依頼を届けられないとき"
 mkdir "$T/failbin"
 cat >"$T/failbin/herdr" <<EOF
@@ -321,7 +420,11 @@ t "再送のコマンドを示す" grep -q 'herdr agent prompt w-blocked' "$T/bl
 t "依頼文が status.md に残る" grep -q '消えてはいけない依頼' "$W/blocked/status.md"
 t "エージェントは残る" has_agent w-blocked
 t "blocked を片付ける" hub-work finish blocked
+}
 
+group_trust() {
+make_env
+prep hub-reset
 echo "# hub-work: フォルダ信頼"
 CJ="$T/claude/.claude.json"
 RE="$(cd "$E" && pwd -P)"
@@ -346,7 +449,11 @@ t "登録できないときは警告する" grep -q '信頼済みにできませ
 tn "登録できないときは書かない" trusted "$RE/.hub-worktrees/trustc/app"
 t "trustc を片付ける" hub-work finish trustc
 rm -rf "$E/plainrepo"
+}
 
+group_outer() {
+make_env
+prep hub-reset
 echo "# hub-work: hub-env と環境の外のリポジトリ"
 mkdir -p "$T/outside/hub" && git -C "$T/outside/hub" init -q -b main && git -C "$T/outside/hub" commit -q --allow-empty -m init
 git -C "$E/hub-env" add -A >/dev/null && git -C "$E/hub-env" commit -q -m init
@@ -360,28 +467,11 @@ t "outer を片付ける" hub-work finish outer
 t "環境の外の hub を worktree なしで対象にできる" hub-work start outerb --repo ../outside/hub
 t "outerb を片付ける" hub-work finish outerb
 tn "存在しない外のパスは拒否する" hub-work start outerc --repo ../outside/none
+}
 
-echo "# hub-work: resume（hub-reset の後）"
-t "worktree の作業を始める" hub-work start again --repo app --worktree
-t "worktree があっても全体リセットできる" hub-reset
-t "リセットで作業のワークスペースが閉じる" no_ws w-again
-t "リセットしても checkout は残る" test -d "$E/.hub-worktrees/again/app"
-t "worktree の作業を立て直す" hub-work resume again
-t "ワークスペースが戻る" has_ws w-again
-t "エージェントが戻る" has_agent w-again
-t "通常の作業を立て直す" hub-work resume plain
-t "通常の作業のエージェントが戻る" has_agent w-plain
-t "resume は冪等" hub-work resume again
-t "二重に作らない" count_ws w-again 1
-t "again を finish できる" hub-work finish again
-hub-work finish plain >"$T/finish-plain" 2>&1; rc=$?
-t "plain を finish できる" test "$rc" -eq 0
-t "finish が棚卸しを促す" grep -q '棚卸し' "$T/finish-plain"
-t "runbook.md も archive へ移る" test -f "$W/archive/plain/runbook.md"
-t "data/ も archive へ移る" test -f "$W/archive/plain/data/x.csv"
-t "runbook.md はコミットされる" git -C "$W" ls-files --error-unmatch archive/plain/runbook.md
-tn "data/ はコミットされない" git -C "$W" ls-files --error-unmatch archive/plain/data/x.csv
-
+group_legacy() {
+make_env
+prep hub-reset
 echo "# hub-work: 既存の work リポジトリ"
 t "古い形の作業を始める" hub-work start legacy --repo app
 mkdir "$W/legacy/data"; echo old >"$W/legacy/data/old.csv"
@@ -407,54 +497,19 @@ t "setup に rules の引数が渡る" grep -q -- '--append-system-prompt-file' 
 envcheck_id="$(herdr workspace list | jq -r '.result.workspaces[] | select(.label == "envcheck") | .workspace_id')"
 herdr workspace close "$envcheck_id" >/dev/null
 cp "$T/toml.bak" "$E/hub-env/hub.toml"
-t "plain のワークスペースが閉じる" no_ws w-plain
-t "作業文書がコミットされる" bash -c "git -C '$W' log --oneline | grep -q 'finish plain'"
+}
 
+group_first_setup() {
+make_env
+prep hub-reset
 echo "# hub-reset: 先頭が setup"
-python3 - "$E/hub-env/hub.toml" <<'EOF'
-import re, sys
-p = sys.argv[1]; s = p and open(p).read()
-head, *blocks = re.split(r"(?=^\[\[workspace\]\]$)", s, flags=re.M)
-blocks[0], blocks[1] = blocks[1], blocks[0]
-open(p, "w").write(head + "".join(blocks))
-EOF
+swap_first
 t "先頭が setup でも全体リセットできる" hub-reset
 t "todo が 1 つだけある" count_ws todo 1
 t "hub-env がある" has_ws hub-env
 t "仮のワークスペースが残らない" no_ws hub-reset-tmp
-
+handoff_tools
 echo "# hub-reset --handoff"
-HF="$(dirname "$R")/handoff.md"
-HI="$T/argv/hub-env.input"
-REAL_HERDR="$(command -v herdr)"
-mkdir "$T/handoffbin"
-# agent prompt の結果を HANDOFF_STUB で差し替え、呼び出しを数える。全呼び出しの引数と環境も記録する
-cat >"$T/handoffbin/herdr" <<EOF
-#!/bin/bash
-env >>"$T/handoff-env"
-if [[ "\$1 \$2" == "agent prompt" ]]; then
-  echo x >>"$T/handoff-prompts"
-  n="\$(wc -l <"$T/handoff-prompts")"
-  case "\${HANDOFF_STUB:-}" in
-    fail) echo '{"error":{"code":"agent_not_found","message":"x"}}' >&2; exit 1 ;;
-    timeout) echo '{"error":{"code":"timeout","message":"x"}}' >&2; exit 1 ;;
-    sent-timeout) "$REAL_HERDR" "\$@" >/dev/null; echo '{"error":{"code":"timeout","message":"x"}}' >&2; exit 1 ;;
-    blocked) echo '{"error":{"code":"agent_blocked","message":"x"}}' >&2; exit 1 ;;
-    blocked-once) if [[ "\$n" == 1 ]]; then echo '{"error":{"code":"agent_blocked","message":"x"}}' >&2; exit 1; fi ;;
-  esac
-fi
-exec "$REAL_HERDR" "\$@"
-EOF
-chmod +x "$T/handoffbin/herdr"
-hstub() { local mode="$1"; shift; : >"$T/handoff-prompts"; PATH="$T/handoffbin:$PATH" HANDOFF_STUB="$mode" HUB_RESET_HANDOFF_WAIT=3 hub-reset "$@"; }
-prompts_are() { [[ "$(wc -l <"$T/handoff-prompts")" == "$1" ]]; }
-ws_id() { herdr workspace list | jq -r --arg l "$1" '.result.workspaces[] | select(.label == $l) | .workspace_id'; }
-tab_ids() { herdr tab list --workspace "$(ws_id "$1")" | jq -c '[.result.tabs[].tab_id]'; }
-wait_long() { local i; for i in $(seq 1 300); do "$@" && return 0; perl -e 'select(undef,undef,undef,0.2)'; done; return 1; }
-input_has() { [[ -f "$HI" && "$(cat "$HI")" == *"$1"* ]]; }
-input_count() { [[ "$(grep -c -F -- "$1" "$HI")" == "$2" ]]; }
-SPECIAL=$'--help -x "二重" \'単一\' $HOME `id` \\back\n二行目 ; rm -rf nope && echo x\n\n  字下げ-固有文字列'
-
 : >"$HI"
 t "特殊文字の引き継ぎで全体を立て直せる" hub-reset --handoff "$SPECIAL"
 t "引き継ぎ文が壊れずに届く" wait_for input_has "$SPECIAL"
@@ -484,7 +539,14 @@ t "エラーが hub を示す" grep -q 'エージェント hub' "$T/hout"
 t "hub が対象外なら対象を閉じない" test "$before" = "$(tab_ids app)"
 t "hub が対象外なら hub も閉じない" test "$hub_before" = "$(tab_ids hub-env)"
 t "hub が対象外なら保存しない" test ! -e "$HF"
+}
 
+group_handoff_fail() {
+make_env
+prep swap_first
+prep hub-reset
+handoff_tools
+echo "# hub-reset --handoff（配送の失敗）"
 hstub fail hub-env --handoff '配送失敗-固有文字列' >"$T/hout" 2>&1; rc=$?
 t "配送に失敗したら失敗を返す" test "$rc" -ne 0
 t "配送に失敗したら残す" test -f "$HF"
@@ -512,7 +574,14 @@ t "timeout でも画面にあれば成功" test "$rc" -eq 0
 t "timeout でも届いていれば再送しない" prompts_are 1
 t "timeout でも届いていれば消す" test ! -e "$HF"
 t "二重に届かない" input_count 'timeout到着-固有文字列' 1
+}
 
+group_handoff_blocked() {
+make_env
+prep swap_first
+prep hub-reset
+handoff_tools
+echo "# hub-reset --handoff（blocked）"
 : >"$HI"
 t "blocked の間は待って送る" hstub blocked-once hub-env --handoff 'blocked解除-固有文字列'
 t "blocked の解除後に届く" wait_for input_has 'blocked解除-固有文字列'
@@ -521,7 +590,14 @@ hstub blocked hub-env --handoff 'blocked継続-固有文字列' >"$T/hout" 2>&1;
 t "blocked が続けば失敗を返す" test "$rc" -ne 0
 t "blocked が続けば残す" test -f "$HF"
 rm -f "$HF"
+}
 
+group_handoff_bg() {
+make_env
+prep swap_first
+prep hub-reset
+handoff_tools
+echo "# hub-reset --handoff（立て直しの失敗と裏の実行）"
 cp "$E/hub-env/hub.toml" "$T/toml.handoff"
 printf '\n[[workspace]]\nlabel = "broken"\ncwd = "app"\nsetup = "broken-setup"\n' >>"$E/hub-env/hub.toml"
 printf '#!/bin/bash\nexit 1\n' >"$E/broken-setup"; chmod +x "$E/broken-setup"
@@ -553,7 +629,13 @@ tn "--handoff なしでは何も送らない" test -s "$HI"
 t "--handoff なしでは handoff.md を作らない" test ! -e "$HF"
 t "--handoff なしでは state のファイルが増えない" test "$before_files" = "$(ls -A "$(dirname "$HF")")"
 t "--help に使い方がある" bash -c 'hub-reset --help | grep -q -- --handoff'
+}
 
+group_resume() {
+make_env
+prep hub-reset
+prep swap_first
+handoff_tools
 echo "# hub-reset --resume"
 SF="$(dirname "$HF")/hub-session.json"
 AH="$T/argv/hub-env.argv"; AA="$T/argv/todo.argv"
@@ -580,7 +662,7 @@ HERDR_WORKSPACE_ID="$own" hub-reset --resume >"$T/rout" 2>&1; rc=$?
 t "自分のタブを閉じるときは裏で続ける" test "$rc" -eq 0
 t "裏の実行でも同じ ID で戻る" wait_long bash -c "grep -A1 -x -- --resume '$AH' 2>/dev/null | tail -1 | grep -qxF '$sid'"
 wait_long has_agent hub; wait_long has_ws app; wait_long has_agent todo
-perl -e 'select(undef,undef,undef,1)'
+wait_long bg_reset_done
 
 before="$(all_ws)"; tabs="$(tab_ids hub-env)"
 tn "--handoff との同時指定はエラー" hub-reset --handoff 文 --resume
@@ -604,7 +686,10 @@ t "--resume なしは新規に起動する" hub-reset
 t "--resume なしでは再開の引数を渡さない" no_resume "$AH"
 t "--resume なしでは新しい ID が記録される" test "$(sid_now)" != "$sid"
 t "--help に --resume がある" bash -c 'hub-reset --help | grep -q -- --resume'
+}
 
+group_install() {
+make_tmp
 echo "# install.sh --env: README"
 I="$T/sample-env"
 mkdir "$I"
@@ -618,6 +703,25 @@ t "sync-guide は配置しない" test ! -e "$I/hub-env/.claude/skills/sync-guid
 printf '手元の README\n' >"$I/hub-env/README.md"
 t "既存の環境にもう一度実行できる" install_env
 t "既存の README を上書きしない" grep -qxF '手元の README' "$I/hub-env/README.md"
+}
+
+# ── 実行 ───────────────────────────────────────────────────
+SUITES=(base ttree parent blocked trust outer legacy first_setup handoff_fail handoff_blocked handoff_bg resume install)
+LOGS="$(mktemp -d /tmp/hubl.XXXXXX)"
+trap 'rm -rf "$LOGS"' EXIT
+for g in "${SUITES[@]}"; do
+  ( SECONDS=0; "group_$g"; echo "## end $SECONDS" ) >"$LOGS/$g" 2>&1 </dev/null &
+done
+wait
+pass=0 fail=0
+for g in "${SUITES[@]}"; do
+  echo "## グループ $g"
+  grep -v '^## end' "$LOGS/$g"
+  pass=$((pass + $(grep -c '^ok   - ' "$LOGS/$g")))
+  fail=$((fail + $(grep -c '^FAIL - ' "$LOGS/$g")))
+  end="$(tail -n 1 "$LOGS/$g")"
+  if [[ "$end" == "## end "* ]]; then echo "（${end#\#\# end } 秒）"; else fail=$((fail + 1)); echo "FAIL - グループ $g が途中で終わりました"; fi
+done
 
 echo
 echo "結果: $pass 件成功 / $fail 件失敗"
