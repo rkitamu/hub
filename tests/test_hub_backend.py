@@ -36,9 +36,13 @@ class BackendNameTest(unittest.TestCase):
     def test_default_is_none(self):
         self.assertEqual(hub_backend.backend_name({}), "none")
 
-    def test_none_is_not_available_yet(self):
-        with self.assertRaises(hublib.HubError):
-            hub_backend.backend_for(Path("/nonexistent"), {})
+    def test_none_backend(self):
+        backend = hub_backend.backend_for(Path("/nonexistent"), {})
+        self.assertIsInstance(backend, hub_backend.NoneBackend)
+        self.assertTrue(backend.manual)
+        self.assertEqual(backend.list_agents(), [])
+        self.assertEqual(backend.start_agent("p", {"name": "a", "cwd": "/a", "argv": []}), "manual")
+        self.assertNotEqual(backend.send("a", "x"), "ok")
 
 
 class LoadModuleTest(unittest.TestCase):

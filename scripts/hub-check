@@ -7,8 +7,7 @@
 
 usage: hub-check
 
-ずれがあれば一覧して exit 1。hub.toml の session に書いたセッションのペインで実行する。
-setup のワークスペースが起動するエージェントは、hub.toml の agents = ["<名前>"] で宣言すると照合できる。
+ずれがあれば一覧して exit 1。エージェントは hub.toml の [[agent]]（旧形式ではペインの agent と setup の agents）と照合する。
 """
 
 from __future__ import annotations
@@ -19,6 +18,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "lib"))
 from hub_backend import Backend, backend_for  # noqa: E402
+from hub_config import agent_defs  # noqa: E402
 from hublib import HubError, find_env, is_git_repo, read_status, work_dir  # noqa: E402
 
 PLANNED = ("未作成", "構想")
@@ -36,17 +36,6 @@ def map_table(text: str, heading: str) -> list[list[str]]:
 
 def name_of(cell: str) -> str:
     return cell.strip().strip("`")
-
-
-def toml_agents(cfg: dict) -> set[str]:
-    names = set()
-    for ws in cfg.get("workspace", []):
-        names.update(ws.get("agents", []))
-        for tab in ws.get("tab", []):
-            for pane in tab.get("pane", []):
-                if pane.get("agent", {}).get("name"):
-                    names.add(pane["agent"]["name"])
-    return names
 
 
 def work_records(wd: Path) -> tuple[set[str], set[str]]:
@@ -71,17 +60,19 @@ def check(env: Path, cfg: dict, backend: Backend) -> list[str]:
     if not map_path.is_file():
         return [f"MAP.md がありません: {map_path}"]
     text = map_path.read_text()
+    try:
+        defs = agent_defs(env, cfg)
+    except HubError as e:
+        return [f"hub.toml: {e}"]
 
     # リポジトリ
     repos = {name_of(r[0]): r[1] if len(r) > 1 else "" for r in map_table(text, "リポジトリ") if r}
-    toml_dirs = {}
-    for ws in cfg.get("workspace", []):
-        d = (env / ws.get("cwd", "")).resolve()
-        toml_dirs[d.name] = d
-        if not d.is_dir():
-            out.append(f"hub.toml: ワークスペース {ws.get('label')} の cwd がありません: {d}")
-        if ws.get("setup") and not (env / ws["setup"]).is_file():
-            out.append(f"hub.toml: ワークスペース {ws.get('label')} の setup がありません: {env / ws['setup']}")
+    toml_dirs = {d.name: d for d in backend.layout_dirs()}
+    for a in defs:
+        if not a["path"].is_dir():
+            out.append(f"hub.toml: エージェント {a['name']} の cwd がありません: {a['path']}")
+        elif is_git_repo(a["path"]):
+            toml_dirs.setdefault(a["path"].name, a["path"])
     actual = {p.name for p in env.iterdir() if p.is_dir() and not p.name.startswith(".") and is_git_repo(p)}
     for name, state in repos.items():
         exists = name in actual or (name in toml_dirs and toml_dirs[name].is_dir())
@@ -92,32 +83,32 @@ def check(env: Path, cfg: dict, backend: Backend) -> list[str]:
             out.append(f"MAP.md: {name} は「{state}」ですが、リポジトリがあります")
     for name in sorted(actual - set(repos)):
         out.append(f"MAP.md: リポジトリ {name} が載っていません")
-    for name, d in toml_dirs.items():
+    for name in sorted(toml_dirs):
         if name not in repos:
-            out.append(f"MAP.md: hub.toml のワークスペースのディレクトリ {name} が載っていません")
+            out.append(f"MAP.md: hub.toml のディレクトリ {name} が載っていません")
 
     # エージェント
-    in_map = {name_of(r[0]) for r in map_table(text, "herdr 上のエージェント") if r}
-    in_toml = toml_agents(cfg)
+    # NOTE: 移行期間は、旧い見出し「herdr 上のエージェント」も読む。
+    rows = map_table(text, "エージェント") or map_table(text, "herdr 上のエージェント")
+    in_map = {name_of(r[0]) for r in rows if r}
+    in_toml = {a["name"] for a in defs}
     for name in sorted(in_map - in_toml):
         out.append(f"エージェント {name}: MAP.md にありますが hub.toml にありません")
     for name in sorted(in_toml - in_map):
         out.append(f"エージェント {name}: hub.toml にありますが MAP.md にありません")
 
     work_agents, work_labels = work_records(work_dir(env))
-    live = {a.get("name") for a in backend.list_agents() if a.get("name")}
-    for name in sorted(in_toml - live):
-        out.append(f"エージェント {name}: hub.toml にありますが動いていません")
-    for name in sorted(live - in_toml - in_map - work_agents):
-        out.append(f"エージェント {name}: 動いていますが、MAP.md にも hub.toml にも作業にもありません")
-    for name in sorted(work_agents - live):
-        out.append(f"エージェント {name}: 進行中の作業に記録がありますが動いていません（hub-work resume）")
+    if not backend.manual:
+        live = {a.get("name") for a in backend.list_agents() if a.get("name")}
+        for name in sorted(in_toml - live):
+            out.append(f"エージェント {name}: hub.toml にありますが動いていません")
+        for name in sorted(live - in_toml - in_map - work_agents):
+            out.append(f"エージェント {name}: 動いていますが、MAP.md にも hub.toml にも作業にもありません")
+        for name in sorted(work_agents - live):
+            out.append(f"エージェント {name}: 進行中の作業に記録がありますが動いていません（hub-work resume）")
 
-    # ワークスペース
-    known = {ws.get("label") for ws in cfg.get("workspace", [])} | work_labels
-    for w in backend.list_places():
-        if w["label"] not in known:
-            out.append(f"ワークスペース {w['label']}: hub.toml にも作業にもありません")
+    # backend のレイアウト（herdr のワークスペースなど）
+    out += backend.check_layout(work_labels)
     return out
 
 
@@ -133,6 +124,8 @@ def main() -> int:
     except HubError as e:
         print(f"error: {e}", file=sys.stderr)
         return 2
+    if backend.manual:
+        print("note: backend が無いので、動いているエージェントとは照合していません")
     if not problems:
         print("ずれはありません")
         return 0

@@ -51,19 +51,26 @@ def find_env() -> tuple[Path, dict]:
         env = Path(explicit).expanduser().resolve()
         if (cfg := read_config(env)) is None:
             raise HubError(f"HUB_ENV の環境の hub.toml を読めません: {env / 'hub-env/hub.toml'}")
-        return env, cfg
+        return _found(env, cfg)
     envs = [(e, c) for e in registered_envs() if (c := read_config(e)) is not None]
     hits = [(e, c) for e, c in envs if detect(e, c)]
     if len(hits) > 1:
         raise HubError(f"このセッションの環境が {len(hits)} 個あります（{ENVS_FILE}）")
     if hits:
-        return hits[0]
+        return _found(*hits[0])
     cwd = Path.cwd().resolve()
     hits = [(e, c) for e, c in envs if cwd == e.resolve() or e.resolve() in cwd.parents]
     if len(hits) == 1:
-        return hits[0]
+        return _found(*hits[0])
     raise HubError(f"環境を特定できません（{ENVS_FILE}）。hub.toml の session に書いたセッションのペインか環境の中で実行するか、"
                    "HUB_ENV に環境のパスを指定してください")
+
+
+def _found(env: Path, cfg: dict) -> tuple[Path, dict]:
+    from hub_config import warn_legacy  # NOTE: hub_config が HubError を import するので、循環を避けて中で読む。
+
+    warn_legacy(cfg)
+    return env, cfg
 
 
 def work_dir(env: Path) -> Path:
@@ -158,7 +165,7 @@ def commander_launch(env: Path, agent: dict, cwd: Path, launch: list[str], recor
     script = HUB_ROOT / "scripts/hub-session-record"
     command = shlex.join([str(script), "--state", str(record), "--cwd", str(cwd)])
     hooks["SessionStart"].append({"hooks": [{"type": "command", "command": command}]})
-    target = record.parent / "hub-agent-settings.json"
+    target = record.parent / record.name.replace("-session.json", "-agent-settings.json")
     target.parent.mkdir(parents=True, exist_ok=True)
     fd, tmp = tempfile.mkstemp(dir=target.parent, prefix=".hub-agent-settings.")
     try:

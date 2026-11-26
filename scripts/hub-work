@@ -136,13 +136,16 @@ def register_trust(env: Path, name: str, wt: dict) -> None:
         print(f"warning: worktree を信頼済みにできませんでした: {e}", file=sys.stderr)
 
 
-def start_agent(backend: Backend, agent: dict, pane: str, launch: list[str], doc_dir: Path) -> None:
+def start_agent(backend: Backend, agent: dict, pane: str, launch: list[str], doc_dir: Path) -> tuple[str, dict]:
+    """起動して (結果, AgentSpec) を返す。結果は backend の start_agent のもの。"""
     kind = agent.get("kind", "claude")
     spec = {"name": agent["name"], "kind": kind, "cwd": agent["cwd"],
             "argv": agent_argv(kind, launch, [], work_access_args(doc_dir))}
+    result = backend.start_agent(pane, spec)
     # 起動はしたが確認ダイアログ（初回のフォルダ信頼など）で止まっている場合は、ユーザーに任せる
-    if backend.start_agent(pane, spec) == "needs_confirm":
+    if result == "needs_confirm":
         print(f"note: {agent['name']} が確認待ちです。そのタブで答えてください", file=sys.stderr)
+    return result, spec
 
 
 def ensure_checkout(wt: dict, repo: Path) -> None:
@@ -157,10 +160,11 @@ def ensure_checkout(wt: dict, repo: Path) -> None:
         git(repo, "worktree", "add", "-b", wt["branch"], str(path))
 
 
-def ensure(backend: Backend, env: Path, meta: dict, doc_dir: Path) -> list[str]:
-    """記録の通りに揃える。新しく起動したエージェントの名前を返す。"""
+def ensure(backend: Backend, env: Path, meta: dict, doc_dir: Path) -> tuple[list[str], list[dict]]:
+    """記録の通りに揃える。(新しく起動したエージェントの名前, 人が起動するエージェントの AgentSpec) を返す。"""
     launch = claude_launch_args(env)
     started: list[str] = []
+    manual: list[dict] = []
     alive = {a.get("name") for a in backend.list_agents()}
     worktrees = {w["repo"]: w for w in meta["worktrees"]}
     fresh: dict[str, str] = {}  # 場所のラベル → まだ使っていない最初の置き場
@@ -186,9 +190,12 @@ def ensure(backend: Backend, env: Path, meta: dict, doc_dir: Path) -> list[str]:
         wt = worktrees.get(agent["repo"])
         if wt and agent.get("kind", "claude") == "claude":
             register_trust(env, doc_dir.name, wt)
-        start_agent(backend, agent, pane, launch, doc_dir)
-        started.append(agent["name"])
-    return started
+        result, spec = start_agent(backend, agent, pane, launch, doc_dir)
+        if result == "manual":
+            manual.append(spec)
+        else:
+            started.append(agent["name"])
+    return started, manual
 
 
 def brief(env: Path, name: str, path: Path, request: str | None, meta: dict) -> str:
@@ -197,9 +204,9 @@ def brief(env: Path, name: str, path: Path, request: str | None, meta: dict) -> 
              f"{path.parent}/runbook.md に、検証データは {path.parent}/data/ に置いてください。秘密情報はどちらにも書かないでください。"
              "担当のリポジトリのほかに書き込んでよいのは、この作業のディレクトリだけです。\n"
              "進捗と結果は、先にこの status.md の本文（進捗・結果）へ書いてください。front matter の state は、"
-             "止まったら blocked にします。そのあと herdr agent prompt hub \"<作業名と要約>\" で司令塔へ通知してください。"
-             "通知が agent_blocked などで拒否されたら、少し待って再送してください。"
-             "timeout の場合は届いた可能性があるので、herdr agent read hub で確かめてから再送してください。"
+             "止まったら blocked にします。そのあと hub-agent notify \"<作業名と要約>\" で司令塔へ通知してください。"
+             "届かなかったと表示されたら、少し待って同じコマンドを実行し直してください。"
+             "backend が無いと表示されたら、通知は要りません（司令塔が status.md を読みます）。"
              "\nコミットや PR は、環境の rules に従ってください。")
     if any((env / r).resolve() == (env / "hub-env").resolve() for r in meta["repos"]):
         rules += ("\nhub-env の CLAUDE.md は司令塔向けですが、あなたは司令塔ではなく、この作業の担当です。"
@@ -216,11 +223,24 @@ def send_briefs(backend: Backend, names: list[str], text: str, doc_dir: Path) ->
             undelivered.append(name)
             saved.write_text(text + "\n")
             print(f"warning: {name} に依頼が届いていません（{result}）。ユーザーに確認し、そのタブの確認に答えてもらってから、"
-                  f"次のコマンドで再送してください:\n  herdr agent prompt {name} \"$(cat {shlex.quote(str(saved))})\"",
+                  f"次のコマンドで再送してください:\n  hub-agent send {name} \"$(cat {shlex.quote(str(saved))})\"",
                   file=sys.stderr)
     if not undelivered:
         saved.unlink(missing_ok=True)
     return undelivered
+
+
+def show_manual(backend: Backend, specs: list[dict], text: str | None, doc_dir: Path) -> None:
+    """backend が起動できないエージェントの起動コマンドを示す。依頼文は最初のプロンプトとして渡す。"""
+    if not specs:
+        return
+    saved = doc_dir / "brief.md"
+    if text:
+        saved.write_text(text + "\n")
+    print("backend が無いので、エージェントは起動していません。それぞれの端末で次のコマンドを実行してください:")
+    for spec in specs:
+        hint = backend.launch_hint(spec)
+        print(f"  {hint} \"$(cat {shlex.quote(str(saved))})\"" if text else f"  {hint}")
 
 
 # ── コマンド ───────────────────────────────────────────────────
@@ -284,13 +304,15 @@ def cmd_start(a: argparse.Namespace, backend: Backend, env: Path, wd: Path) -> i
     write_status(path, meta, body)
     commit(wd, f"start {a.name}")
     try:
-        started = ensure(backend, env, meta, path.parent)
+        started, manual = ensure(backend, env, meta, path.parent)
     except HubError as e:
         raise HubError(f"{e}\n途中まで作りました。hub-work resume {a.name} で続けるか、hub-work finish {a.name} で片付けてください")
     finally:
         write_status(path, meta, body)
         commit(wd, f"record {a.name}")
-    undelivered = send_briefs(backend, started, brief(env, a.name, path, a.request, meta), path.parent) if a.request else []
+    text = brief(env, a.name, path, a.request, meta) if a.request else None
+    undelivered = send_briefs(backend, started, text, path.parent) if text else []
+    show_manual(backend, manual, text, path.parent)
     commit(wd, f"brief {a.name}")
     print(f"作業 {a.name} を始めました: {path}")
     print(f"エージェント: {', '.join(x['name'] for x in agents)}")
@@ -304,12 +326,13 @@ def cmd_resume(a: argparse.Namespace, backend: Backend, env: Path, wd: Path) -> 
         raise HubError(f"作業 {a.name} は done です")
     ensure_work_ignore(wd)
     try:
-        started = ensure(backend, env, meta, path.parent)
+        started, manual = ensure(backend, env, meta, path.parent)
     finally:
         write_status(path, meta, body)
         commit(wd, f"resume {a.name}")
-    undelivered = send_briefs(backend, started, brief(env, a.name, path, "herdr-reset などで中断した作業の再開です。status.md の進捗から続けてください。", meta),
-                              path.parent)
+    text = brief(env, a.name, path, "herdr-reset などで中断した作業の再開です。status.md の進捗から続けてください。", meta)
+    undelivered = send_briefs(backend, started, text, path.parent)
+    show_manual(backend, manual, text, path.parent)
     commit(wd, f"brief {a.name}")
     print(f"作業 {a.name} を立て直しました（起動: {', '.join(started) or 'なし'}）")
     return 1 if undelivered else 0
@@ -368,6 +391,7 @@ def cmd_list(a: argparse.Namespace, backend: Backend, env: Path, wd: Path) -> in
     rows = []
     roots = [(wd, "")] + ([(wd / "archive", "archive/")] if a.all else [])
     alive = {x.get("name"): x.get("status") for x in backend.list_agents()}
+    missing = "不明" if backend.manual else "停止"
     for root, prefix in roots:
         if not root.is_dir():
             continue
@@ -377,7 +401,7 @@ def cmd_list(a: argparse.Namespace, backend: Backend, env: Path, wd: Path) -> in
             except (OSError, HubError) as e:
                 rows.append((prefix + d.name, "error", "-", str(e), "-"))
                 continue
-            st = ", ".join(f"{x['name']}={alive.get(x['name'], '停止')}" for x in meta["agents"]) if not prefix else "-"
+            st = ", ".join(f"{x['name']}={alive.get(x['name'], missing)}" for x in meta["agents"]) if not prefix else "-"
             rows.append((prefix + d.name, meta["state"], str(meta["todo"] or "-"), ",".join(meta["repos"]), st))
     if not rows:
         print("作業はありません")

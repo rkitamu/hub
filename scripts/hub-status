@@ -17,13 +17,15 @@ from datetime import date, datetime, timedelta
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "lib"))
-from hub_backend import backend_for  # noqa: E402
+from hub_backend import Backend, backend_for  # noqa: E402
+from hub_config import agent_defs  # noqa: E402
 from hublib import HubError, dirty_files, find_env, is_git_repo, read_status, todo_file, work_dir  # noqa: E402
 
 
-def repo_dirs(env: Path, cfg: dict) -> list[Path]:
+def repo_dirs(env: Path, cfg: dict, backend: Backend) -> list[Path]:
     dirs = {p.resolve() for p in env.iterdir() if p.is_dir() and not p.name.startswith(".") and is_git_repo(p)}
-    dirs |= {(env / ws["cwd"]).resolve() for ws in cfg.get("workspace", []) if ws.get("cwd")}
+    dirs |= set(backend.layout_dirs())
+    dirs |= {a["path"] for a in agent_defs(env, cfg)}
     return sorted(d for d in dirs if d.is_dir() and is_git_repo(d))
 
 
@@ -56,12 +58,14 @@ def main() -> int:
         agents = [x for x in backend.list_agents() if x.get("name")]
         for x in sorted(agents, key=lambda x: x["name"]):
             print(f"{x['name']}\t{x.get('status')}\t{x.get('cwd')}")
-        if not agents:
+        if backend.manual:
+            print("（backend が無いので確認できません）")
+        elif not agents:
             print("（なし）")
 
         print("\n## 未コミットの変更")
         clean = True
-        for d in repo_dirs(env, cfg):
+        for d in repo_dirs(env, cfg, backend):
             if files := dirty_files(d):
                 clean = False
                 print(f"{d.name}\t{len(files)} 件")

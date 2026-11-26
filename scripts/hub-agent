@@ -1,0 +1,155 @@
+#!/usr/bin/env -S uv run --quiet --script
+# /// script
+# requires-python = ">=3.11"
+# dependencies = []
+# ///
+"""環境のエージェントとやり取りする。backend（hub.toml で選ぶ）によらず同じ書き方で使う。
+
+usage:
+  hub-agent list                       動いているエージェントと状態
+  hub-agent send <名前> <依頼>          エージェントに送る
+  hub-agent read <名前> [--lines <N>]   エージェントの画面を読む
+  hub-agent notify <作業名と要約>        司令塔へ通知する。確認待ちなら待って送り直し、timeout なら画面で確かめる
+  hub-agent launch <名前> [--print]     hub.toml の [[agent]] の通りに、この端末で claude を起動する（--print は表示だけ）
+
+終了コード: 0 成功 / 1 失敗 / 3 backend が無いので送れない
+"""
+
+from __future__ import annotations
+
+import argparse
+import os
+import shlex
+import sys
+import time
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "lib"))
+from hub_backend import Backend, backend_for  # noqa: E402
+from hub_config import commander_name, find_agent, session_record_name  # noqa: E402
+from hublib import HubError, agent_argv, claude_launch_args, commander_launch, env_state_dir, find_env  # noqa: E402
+
+NO_BACKEND = 3
+# 確認待ちの司令塔に送り直し続ける秒数と間隔。テストでは環境変数で短くする。
+NOTIFY_WAIT = 120.0
+NOTIFY_INTERVAL = 5.0
+
+
+def env_seconds(name: str, default: float) -> float:
+    try:
+        return float(os.environ.get(name) or default)
+    except ValueError:
+        return default
+
+
+def no_backend(backend: Backend) -> int:
+    print(f"backend が無いので送れません（hub.toml の backend: {backend.name}）", file=sys.stderr)
+    return NO_BACKEND
+
+
+def cmd_list(a, backend: Backend, env: Path, cfg: dict) -> int:
+    if backend.manual:
+        return no_backend(backend)
+    for x in sorted((x for x in backend.list_agents() if x.get("name")), key=lambda x: x["name"]):
+        print(f"{x['name']}\t{x.get('status')}\t{x.get('cwd')}")
+    return 0
+
+
+def cmd_send(a, backend: Backend, env: Path, cfg: dict) -> int:
+    if backend.manual:
+        return no_backend(backend)
+    result = backend.send(a.name, a.text)
+    if result != "ok":
+        print(f"{a.name} に届きませんでした（{result}）", file=sys.stderr)
+        return 1
+    return 0
+
+
+def cmd_read(a, backend: Backend, env: Path, cfg: dict) -> int:
+    if backend.manual:
+        return no_backend(backend)
+    sys.stdout.write(backend.read(a.name, a.lines))
+    return 0
+
+
+def seen(backend: Backend, name: str, text: str) -> bool:
+    """送った文が画面に出ているか。長い文は折り返しや省略があるので、先頭の 1 行の一部で確かめる。"""
+    head = text.strip().splitlines()[0][:40] if text.strip() else ""
+    return bool(head) and head in backend.read(name, 400)
+
+
+def cmd_notify(a, backend: Backend, env: Path, cfg: dict) -> int:
+    if backend.manual:
+        return no_backend(backend)
+    name = commander_name(cfg)
+    deadline = time.monotonic() + env_seconds("HUB_AGENT_NOTIFY_WAIT", NOTIFY_WAIT)
+    interval = env_seconds("HUB_AGENT_NOTIFY_INTERVAL", NOTIFY_INTERVAL)
+    while True:
+        result = backend.send(name, a.text)
+        if result == "ok":
+            print(f"{name} へ通知しました")
+            return 0
+        # timeout は届いている場合があるので、二重に送らないよう画面で確かめる
+        if result == "timeout" and seen(backend, name, a.text):
+            print(f"{name} の画面に届いていることを確かめました")
+            return 0
+        if result not in ("blocked", "timeout") or time.monotonic() >= deadline:
+            print(f"{name} へ届きませんでした（{result}）。status.md に書いてあれば、司令塔はそれを読みます", file=sys.stderr)
+            return 1
+        time.sleep(interval)
+
+
+def launch_argv(env: Path, cfg: dict, agent: dict) -> list[str]:
+    launch = claude_launch_args(env)
+    if agent["name"] == commander_name(cfg) and agent["kind"] == "claude":
+        record = env_state_dir(env) / session_record_name(cfg)
+        launch = commander_launch(env, agent, agent["path"], launch, record) or launch
+    return agent_argv(agent["kind"], launch, agent["args"])
+
+
+def cmd_launch(a, backend: Backend, env: Path, cfg: dict) -> int:
+    agent = find_agent(env, cfg, a.name)
+    argv = launch_argv(env, cfg, agent)
+    spec = {"name": agent["name"], "kind": agent["kind"], "cwd": str(agent["path"]), "argv": argv}
+    if a.print:
+        print(backend.launch_hint(spec))
+        return 0
+    if not agent["path"].is_dir():
+        raise HubError(f"{agent['name']} の cwd がありません: {agent['path']}")
+    os.chdir(agent["path"])
+    cmd = [agent["kind"], *argv]
+    try:
+        os.execvp(cmd[0], cmd)
+    except OSError as e:
+        raise HubError(f"起動できません: {shlex.join(cmd)}: {e.strerror}")
+
+
+def main() -> int:
+    p = argparse.ArgumentParser(prog="hub-agent", description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    sub = p.add_subparsers(dest="cmd", required=True)
+    sub.add_parser("list")
+    s = sub.add_parser("send")
+    s.add_argument("name")
+    s.add_argument("text")
+    r = sub.add_parser("read")
+    r.add_argument("name")
+    r.add_argument("--lines", type=int, default=120)
+    sub.add_parser("notify").add_argument("text")
+    la = sub.add_parser("launch")
+    la.add_argument("name")
+    la.add_argument("--print", action="store_true")
+    a = p.parse_args()
+    try:
+        env, cfg = find_env()
+        backend = backend_for(env, cfg)
+        if a.cmd != "launch":
+            backend.check()
+        return {"list": cmd_list, "send": cmd_send, "read": cmd_read, "notify": cmd_notify,
+                "launch": cmd_launch}[a.cmd](a, backend, env, cfg)
+    except HubError as e:
+        print(f"error: {e}", file=sys.stderr)
+        return 1
+
+
+if __name__ == "__main__":
+    sys.exit(main())

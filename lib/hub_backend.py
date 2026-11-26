@@ -34,6 +34,8 @@ class Backend:
     """backend の操作の一覧。実装はこれを継承し、使う操作を上書きする。"""
 
     name = "?"
+    # True なら、エージェントを起動も一覧もできない（起動コマンドを人に示すだけ）
+    manual = False
 
     def __init__(self, env: Path, cfg: dict):
         self.env = env
@@ -67,7 +69,7 @@ class Backend:
         raise NotImplementedError
 
     def start_agent(self, pane: str, spec: dict) -> str:
-        """起動して "started" を返す。確認ダイアログで止まっていれば "needs_confirm"。失敗は BackendError。"""
+        """起動して "started" を返す。確認ダイアログで止まっていれば "needs_confirm"、起動できない backend は "manual"。失敗は BackendError。"""
         raise NotImplementedError
 
     def send(self, name: str, text: str) -> str:
@@ -86,10 +88,46 @@ class Backend:
         """場所を閉じ、閉じたら True。worktree は記録（data を含む）。checkout が残れば core が消す。"""
         raise NotImplementedError
 
+    def layout_dirs(self) -> list[Path]:
+        """backend のレイアウトが使うディレクトリ（hub-status・hub-check がリポジトリとして数える）。"""
+        return []
+
+    def check_layout(self, work_labels: set[str]) -> list[str]:
+        """backend のレイアウトと実際の状態のずれ（hub-check が出す）。work_labels は作業が記録した場所のラベル。"""
+        return []
+
     def launch_hint(self, spec: dict) -> str:
         """人が手で起動するためのコマンド。"""
         cmd = [spec.get("kind", "claude"), *spec.get("argv", [])]
         return f"cd {shlex.quote(str(spec['cwd']))} && {shlex.join(cmd)}"
+
+
+class NoneBackend(Backend):
+    """backend なし。場所もエージェントも作らず、起動コマンドを人に示す。"""
+
+    name = "none"
+    manual = True
+
+    def list_agents(self) -> list[dict]:
+        return []
+
+    def list_places(self) -> list[dict]:
+        return []
+
+    def open_place(self, label: str, cwd: Path, title: str, worktree: dict | None = None) -> dict:
+        return {"place": label, "pane": label, "data": {}}
+
+    def add_slot(self, place: str, cwd: Path, title: str) -> str:
+        return place
+
+    def start_agent(self, pane: str, spec: dict) -> str:
+        return "manual"
+
+    def send(self, name: str, text: str) -> str:
+        return "no_backend"
+
+    def close_place(self, label: str, worktree: dict | None = None) -> bool:
+        return False
 
 
 def load_module(name: str) -> ModuleType:
@@ -130,5 +168,5 @@ def detect(env: Path, cfg: dict) -> bool:
 def backend_for(env: Path, cfg: dict) -> Backend:
     name = backend_name(cfg)
     if name == "none":
-        raise HubError("hub.toml に backend がありません（backend か session を書いてください）")
+        return NoneBackend(env, cfg)
     return load_module(name).create(env, cfg)

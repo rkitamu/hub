@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import copy
 import json
 import os
 import subprocess
@@ -10,6 +11,8 @@ import time
 from pathlib import Path
 
 from hub_backend import Backend, BackendError
+from hub_config import agent_defs, is_legacy
+from hublib import HubError
 
 
 class HerdrError(BackendError):
@@ -50,6 +53,40 @@ def session_of(cfg: dict) -> str | None:
 def detect(env: Path, cfg: dict) -> bool:
     current = os.environ.get("HERDR_SESSION")
     return bool(current) and current == session_of(cfg)
+
+
+def layout(env: Path, cfg: dict) -> list[dict]:
+    """herdr のワークスペースの定義を、旧形式の形（ペインの agent が {name, kind, args} の表）で返す。
+
+    新形式では [herdr] の [[herdr.workspace]] を読み、ペインの agent = "<name>" を [[agent]] の定義に置き換える。
+    ペインの cwd は、書かれていなければエージェントの cwd にする。
+    """
+    if is_legacy(cfg):
+        return copy.deepcopy(cfg.get("workspace") or [])
+    defs = {a["name"]: a for a in agent_defs(env, cfg)}
+    wss = copy.deepcopy((cfg.get("herdr") or {}).get("workspace") or [])
+    for ws in wss:
+        label = ws.get("label")
+        for name in ws.get("agents", []):
+            if name not in defs:
+                raise HubError(f"[[herdr.workspace]] {label} の agents の {name} が [[agent]] にありません")
+        for tab in ws.get("tab", []):
+            for pane in tab.get("pane", []):
+                if "agent" not in pane:
+                    continue
+                ref = pane["agent"]
+                if not isinstance(ref, str):
+                    raise HubError(f"ワークスペース {label} のペイン: agent には [[agent]] の name を書いてください")
+                if ref not in defs:
+                    raise HubError(f"ワークスペース {label} のペイン: agent の {ref} が [[agent]] にありません")
+                d = defs[ref]
+                if d["launched_by"] == "setup":
+                    raise HubError(f"ワークスペース {label} のペイン: {ref} は launched_by = \"setup\" です")
+                if pane.get("cwd") and (env / pane["cwd"]).resolve() != d["path"]:
+                    raise HubError(f"ワークスペース {label} のペイン: cwd が {ref} の cwd と違います")
+                pane["cwd"] = d["cwd"]
+                pane["agent"] = {"name": d["name"], "kind": d["kind"], "args": d["args"]}
+    return wss
 
 
 def create(env: Path, cfg: dict) -> "HerdrBackend":
@@ -160,6 +197,32 @@ class HerdrBackend(Backend):
         p = subprocess.run(["herdr", "agent", "read", name, "--source", "recent-unwrapped", "--lines", str(lines)],
                            capture_output=True, text=True)
         return p.stdout if p.returncode == 0 else ""
+
+    # ── 検査 ──
+
+    def layout_dirs(self) -> list[Path]:
+        try:
+            return [(self.env / ws["cwd"]).resolve() for ws in layout(self.env, self.cfg) if ws.get("cwd")]
+        except HubError:
+            return []
+
+    def check_layout(self, work_labels: set[str]) -> list[str]:
+        try:
+            wss = layout(self.env, self.cfg)
+        except HubError as e:
+            return [f"hub.toml: {e}"]
+        out: list[str] = []
+        for ws in wss:
+            d = (self.env / ws.get("cwd", "")).resolve()
+            if not d.is_dir():
+                out.append(f"hub.toml: ワークスペース {ws.get('label')} の cwd がありません: {d}")
+            if ws.get("setup") and not (self.env / ws["setup"]).is_file():
+                out.append(f"hub.toml: ワークスペース {ws.get('label')} の setup がありません: {self.env / ws['setup']}")
+        known = {ws.get("label") for ws in wss} | work_labels
+        for w in workspaces():
+            if w["label"] not in known:
+                out.append(f"ワークスペース {w['label']}: hub.toml にも作業にもありません")
+        return out
 
     # ── 片付け ──
 

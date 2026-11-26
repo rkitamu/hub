@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 # hub のコマンドを、一時ディレクトリの環境と専用の herdr サーバーで通しで試す。
 # 使い方: tests/integration.sh [todo-herdr のパス]
+# HUB_TEST_TOML=new で、環境の hub.toml を新形式（[[agent]] と [herdr]）に書き換えてから流す。既定は旧形式。
 # 実際のセッションに触らないよう、XDG_CONFIG_HOME ごと一時ディレクトリへ移し、ソケットがその中でなければ止まる。
 # setup の確認には同梱の代替スクリプトを使う。todo-herdr のパスを渡すと、そのコピーを使う（元のファイルには触らない）。
 # 互いに状態を共有しないグループごとに、一時ディレクトリと専用の herdr サーバーを作り、並列に実行する。
@@ -8,6 +9,8 @@ set -uo pipefail
 
 HUB="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 TODO_HERDR="${1:-}"
+# 司令塔の名前と、herdr のワークスペースの見出し。新形式では commander と [[herdr.workspace]]
+if [[ "${HUB_TEST_TOML:-old}" == new ]]; then CMDR=commander WSH='[[herdr.workspace]]'; else CMDR=hub WSH='[[workspace]]'; fi
 unset HERDR_ENV HERDR_PANE_ID HERDR_TAB_ID HERDR_WORKSPACE_ID HERDR_SOCKET_PATH HERDR_SESSION
 export SHELL=/bin/bash
 export GIT_AUTHOR_NAME=t GIT_AUTHOR_EMAIL=t@example.invalid GIT_COMMITTER_NAME=t GIT_COMMITTER_EMAIL=t@example.invalid
@@ -157,6 +160,11 @@ cat >"$E/hub-env/MAP.md" <<'EOF'
 | `hub` | hub-env | herdr-reset | 司令塔 |
 | `todo` | todo | herdr-reset todo | TODO |
 EOF
+if [[ "$CMDR" == commander ]]; then
+  "$HUB/contrib/herdr/migrate-hub-toml" "$E/hub-env/hub.toml" --write >/dev/null && rm "$E/hub-env/hub.toml.bak" ||
+    { echo "hub.toml を新形式にできませんでした"; exit 1; }
+  sed -i 's/^| `hub` | hub-env |/| `commander` | hub-env |/' "$E/hub-env/MAP.md"
+fi
 echo "$E" >"$T/config/hub/envs"
 mkdir "$E/hub-env/rules"
 printf '環境ルール-固有文字列\n' >"$E/hub-env/rules/local.md"
@@ -175,10 +183,10 @@ HI="$T/argv/hub-env.input"
 
 # hub.toml の先頭を setup のワークスペースにする
 swap_first() {
-python3 - "$E/hub-env/hub.toml" <<'EOF'
+python3 - "$E/hub-env/hub.toml" "$WSH" <<'EOF'
 import re, sys
 p = sys.argv[1]; s = p and open(p).read()
-head, *blocks = re.split(r"(?=^\[\[workspace\]\]$)", s, flags=re.M)
+head, *blocks = re.split(rf"(?=^{re.escape(sys.argv[2])}$)", s, flags=re.M)
 blocks[0], blocks[1] = blocks[1], blocks[0]
 open(p, "w").write(head + "".join(blocks))
 EOF
@@ -233,7 +241,7 @@ echo "# rules と agent-settings"
 A="$T/argv/hub-env.argv"
 t "agent の args を保つ" grep -qx -- 'test-model' "$A"
 HS="$(grep -A1 -- '--settings' "$A" | tail -1)"
-t "hub に生成した設定を渡す" test "$HS" = "$(dirname "$(grep -A1 -- '--append-system-prompt-file' "$A" | tail -1)")/hub-agent-settings.json"
+t "hub に生成した設定を渡す" test "$HS" = "$(dirname "$(grep -A1 -- '--append-system-prompt-file' "$A" | tail -1)")/$CMDR-agent-settings.json"
 t "生成した設定は agent-settings のフックを保つ" jq -e '.hooks.PreToolUse[0].matcher == "Bash"' "$HS"
 t "生成した設定に記録フックがある" jq -e '.hooks.SessionStart[0].hooks[0].command | contains("hub-session-record")' "$HS"
 t "--append-system-prompt-file を渡す" grep -qx -- '--append-system-prompt-file' "$A"
@@ -254,7 +262,7 @@ t "雛形の settings が JSON として正しい" jq -e '.hooks.PreToolUse[0].m
 t "雛形は hub-commit-guard を登録する" bash -c "jq -r '.hooks.PreToolUse[0].hooks[0].command' '$E/hub-env/agent-settings.json' | grep -qF -- '$HUB/scripts/hub-commit-guard'"
 cp "$E/hub-env/agent-settings.json" "$T/settings.bak"; echo '{broken' >"$E/hub-env/agent-settings.json"
 tn "壊れた settings ではリセットしない" herdr-reset
-t "壊れた settings では何も閉じない" has_agent hub
+t "壊れた settings では何も閉じない" has_agent "$CMDR"
 cp "$T/settings.bak" "$E/hub-env/agent-settings.json"
 
 
@@ -294,7 +302,7 @@ tn "他の作業の場所は許可しない" grep -qF "$W/plain" "$A"
 tn "work 全体は許可しない" grep -qxF "Edit(/$W/**)" "$A"
 t "作業エージェントにも rules を渡す" grep -qx -- '--append-system-prompt-file' "$A"
 t "hub 以外には agent-settings をそのまま渡す" grep -qx -- "$E/hub-env/agent-settings.json" "$A"
-tn "hub 以外には記録フックの設定を渡さない" grep -q hub-agent-settings "$A"
+tn "hub 以外には記録フックの設定を渡さない" grep -q "$CMDR-agent-settings" "$A"
 mkdir -p "$W/plain/data"; echo secret >"$W/plain/data/x.csv"; echo memo >"$W/plain/runbook.md"
 t "data/ は git から外れる" git -C "$W" check-ignore -q plain/data/x.csv
 tn "runbook.md は外れない" git -C "$W" check-ignore -q plain/runbook.md
@@ -416,7 +424,7 @@ EOF
 chmod +x "$T/failbin/herdr"
 PATH="$T/failbin:$PATH" hub-work start blocked --repo app --request 消えてはいけない依頼 >"$T/blocked" 2>&1; rc=$?
 t "届かなければ失敗を返す" test "$rc" -ne 0
-t "再送のコマンドを示す" grep -q 'herdr agent prompt w-blocked' "$T/blocked"
+t "再送のコマンドを示す" grep -q 'hub-agent send w-blocked' "$T/blocked"
 t "依頼文が status.md に残る" grep -q '消えてはいけない依頼' "$W/blocked/status.md"
 t "エージェントは残る" has_agent w-blocked
 t "blocked を片付ける" hub-work finish blocked
@@ -491,7 +499,7 @@ herdr workspace create --cwd "\$PWD" --label envcheck --no-focus >/dev/null
 EOF
 chmod +x "$E/setup-check"
 cp "$E/hub-env/hub.toml" "$T/toml.bak"
-printf '\n[[workspace]]\nlabel = "envcheck"\ncwd = "app"\nsetup = "setup-check"\n' >>"$E/hub-env/hub.toml"
+printf '\n%s\nlabel = "envcheck"\ncwd = "app"\nsetup = "setup-check"\n' "$WSH" >>"$E/hub-env/hub.toml"
 t "setup を実行できる" herdr-reset envcheck
 t "setup に rules の引数が渡る" grep -q -- '--append-system-prompt-file' "$T/setup-args"
 envcheck_id="$(herdr workspace list | jq -r '.result.workspaces[] | select(.label == "envcheck") | .workspace_id')"
@@ -535,7 +543,7 @@ t "引数エラーでは保存しない" test ! -e "$HF"
 before="$(tab_ids app)"; hub_before="$(tab_ids hub-env)"
 herdr-reset app --handoff 対象外 >"$T/hout" 2>&1; rc=$?
 t "hub が対象外ならエラー" test "$rc" -ne 0
-t "エラーが hub を示す" grep -q 'エージェント hub' "$T/hout"
+t "エラーが hub を示す" grep -q "エージェント $CMDR" "$T/hout"
 t "hub が対象外なら対象を閉じない" test "$before" = "$(tab_ids app)"
 t "hub が対象外なら hub も閉じない" test "$hub_before" = "$(tab_ids hub-env)"
 t "hub が対象外なら保存しない" test ! -e "$HF"
@@ -599,7 +607,7 @@ prep herdr-reset
 handoff_tools
 echo "# herdr-reset --handoff（立て直しの失敗と裏の実行）"
 cp "$E/hub-env/hub.toml" "$T/toml.handoff"
-printf '\n[[workspace]]\nlabel = "broken"\ncwd = "app"\nsetup = "broken-setup"\n' >>"$E/hub-env/hub.toml"
+printf '\n%s\nlabel = "broken"\ncwd = "app"\nsetup = "broken-setup"\n' "$WSH" >>"$E/hub-env/hub.toml"
 printf '#!/bin/bash\nexit 1\n' >"$E/broken-setup"; chmod +x "$E/broken-setup"
 herdr-reset --handoff '立て直し失敗-固有文字列' >"$T/hout" 2>&1; rc=$?
 t "立て直しに失敗したら失敗を返す" test "$rc" -ne 0
@@ -615,7 +623,7 @@ t "自分のタブを閉じるときは裏で続ける" test "$rc" -eq 0
 t "裏で続けることを知らせる" grep -q '裏で立て直します' "$T/hout"
 t "裏の実行でも引き継ぎが届く" wait_long input_has $'裏実行-固有文字列\n二行目'
 t "裏の実行でも配送後に消す" wait_long test ! -e "$HF"
-t "裏の実行のログに成功が出る" wait_long grep -q '引き継ぎを hub へ届けました' "$T/state/herdr-reset.log"
+t "裏の実行のログに成功が出る" wait_long grep -q "引き継ぎを $CMDR へ届けました" "$T/state/herdr-reset.log"
 tn "裏の実行のログに引き継ぎ文を出さない" grep -q '裏実行-固有文字列' "$T/state/herdr-reset.log"
 tn "環境変数に引き継ぎ文を出さない" grep -q '裏実行-固有文字列' "$T/handoff-env"
 t "裏の実行は 1 回だけ送る" prompts_are 1
@@ -637,7 +645,7 @@ prep herdr-reset
 prep swap_first
 handoff_tools
 echo "# herdr-reset --resume"
-SF="$(dirname "$HF")/hub-session.json"
+SF="$(dirname "$HF")/$CMDR-session.json"
 AH="$T/argv/hub-env.argv"; AA="$T/argv/todo.argv"
 sid_now() { jq -r .session_id "$SF"; }
 resumes() { grep -A1 -x -- '--resume' "$1" | tail -1 | grep -qxF "$2"; }
@@ -661,7 +669,7 @@ rm -f "$AH"; own="$(ws_id hub-env)"
 HERDR_WORKSPACE_ID="$own" herdr-reset --resume >"$T/rout" 2>&1; rc=$?
 t "自分のタブを閉じるときは裏で続ける" test "$rc" -eq 0
 t "裏の実行でも同じ ID で戻る" wait_long bash -c "grep -A1 -x -- --resume '$AH' 2>/dev/null | tail -1 | grep -qxF '$sid'"
-wait_long has_agent hub; wait_long has_ws app; wait_long has_agent todo
+wait_long has_agent "$CMDR"; wait_long has_ws app; wait_long has_agent todo
 wait_long bg_reset_done
 
 before="$(all_ws)"; tabs="$(tab_ids hub-env)"
@@ -686,6 +694,12 @@ t "--resume なしは新規に起動する" herdr-reset
 t "--resume なしでは再開の引数を渡さない" no_resume "$AH"
 t "--resume なしでは新しい ID が記録される" test "$(sid_now)" != "$sid"
 t "--help に --resume がある" bash -c 'herdr-reset --help | grep -q -- --resume'
+if [[ "$CMDR" == commander ]]; then
+  echo "# herdr-reset --resume（新形式に書き換える前の記録）"
+  sid="$(sid_now)"; mv "$SF" "$(dirname "$SF")/hub-session.json"
+  t "hub-session.json からも再開できる" herdr-reset --resume
+  t "旧い記録の ID で戻る" resumes "$AH" "$sid"
+fi
 }
 
 group_wtshape() {
@@ -734,6 +748,110 @@ t "checkout が消える" test ! -e "$E/.hub-worktrees/wb"
 t "worktree の登録が残らない" bash -c "! git -C '$E/app' worktree list | grep -q hub-worktrees && ! git -C '$E/solo' worktree list | grep -q hub-worktrees"
 }
 
+group_notify() {
+make_env
+prep herdr-reset
+handoff_tools
+echo "# hub-agent: 通知と送受信（司令塔は $CMDR）"
+nstub() { local mode="$1"; shift; : >"$T/handoff-prompts"; PATH="$T/handoffbin:$PATH" HANDOFF_STUB="$mode" HUB_AGENT_NOTIFY_WAIT=2 HUB_AGENT_NOTIFY_INTERVAL=0.2 hub-agent notify "$@"; }
+: >"$HI"
+t "司令塔へ通知できる" nstub none "通知-固有1"
+t "司令塔に届く" wait_for input_has "通知-固有1"
+t "確認待ちなら待って送り直す" nstub blocked-once "通知-固有2"
+t "送り直した通知が届く" wait_for input_has "通知-固有2"
+tn "確認待ちが続けば失敗を返す" nstub blocked "通知-固有3"
+t "timeout でも画面にあれば成功" nstub sent-timeout "通知-固有4"
+t "timeout で届いていれば送り直さない" prompts_are 1
+t "二重に届かない" input_count "通知-固有4" 1
+tn "届かない宛先なら失敗を返す" nstub fail "通知-固有5"
+t "届かない宛先には送り直さない" prompts_are 1
+t "送れる" hub-agent send todo "送信-固有"
+t "一覧に出る" bash -c "hub-agent list | grep -q '^todo'"
+t "画面を読める" bash -c "hub-agent read $CMDR --lines 40 | grep -q 通知-固有1"
+hub-agent launch "$CMDR" --print >"$T/launch" 2>&1
+t "起動コマンドに agent の args がある" grep -q -- 'test-model' "$T/launch"
+t "司令塔の起動コマンドに記録の設定がある" grep -q -- "$CMDR-agent-settings.json" "$T/launch"
+t "起動コマンドに rules がある" grep -q -- '--append-system-prompt-file' "$T/launch"
+tn "知らないエージェントは起動しない" hub-agent launch nobody --print
+}
+
+group_none() {
+make_tmp
+cat >"$T/bin/claude" <<'EOF'
+#!/bin/bash
+printf '%s\n' "$@" >"$HUB_TEST_ARGV/$(basename "$PWD").argv"
+settings=""; a=("$@")
+for i in "${!a[@]}"; do [[ "${a[$i]}" == --settings ]] && settings="${a[$((i + 1))]}"; done
+if [[ -n "$settings" ]]; then
+  sid="$(cat /proc/sys/kernel/random/uuid)"; tr="$HUB_TEST_ARGV/$sid.jsonl"; : >"$tr"
+  jq -r '.hooks.SessionStart[]?.hooks[]?.command' "$settings" | while IFS= read -r c; do
+    jq -n --arg s "$sid" --arg t "$tr" --arg c "$PWD" '{hook_event_name:"SessionStart",session_id:$s,transcript_path:$t,cwd:$c,source:"startup"}' | bash -c "$c"
+  done
+fi
+EOF
+chmod +x "$T/bin/claude"
+E="$T/env"; W="$E/hub-env/work"
+mkdir -p "$E/hub-env" "$E/app"
+git -C "$E/hub-env" init -q -b main && printf '/work/\n' >"$E/hub-env/.gitignore"
+git -C "$E/app" init -q -b main && git -C "$E/app" commit -q --allow-empty -m init
+cat >"$E/hub-env/hub.toml" <<'EOF'
+backend = "none"
+
+[[agent]]
+name = "commander"
+cwd = "hub-env"
+EOF
+cat >"$E/hub-env/MAP.md" <<'EOF'
+# 地図
+
+## リポジトリ
+
+| リポジトリ | 状態 | 関心事 | 入口のドキュメント |
+|---|---|---|---|
+| `hub-env` | 稼働 | 司令塔 | - |
+| `app` | 稼働 | アプリ | - |
+
+## エージェント
+
+| 名前 | cwd | 起動 | できること |
+|---|---|---|---|
+| `commander` | hub-env | hub-agent launch commander | 司令塔 |
+EOF
+echo "$E" >"$T/config/hub/envs"
+cd "$E/hub-env"
+echo "# backend なし（herdr を使わない）"
+hub-work start nb --repo app --worktree --request 'backendなし依頼-固有' >"$T/nb" 2>&1; rc=$?
+t "作業を始められる" test "$rc" -eq 0
+t "worktree ができる" test -d "$E/.hub-worktrees/nb/app"
+t "status.md ができる" test -f "$W/nb/status.md"
+t "起動していないことを知らせる" grep -q 'backend が無いので' "$T/nb"
+t "依頼文を brief.md に残す" grep -q 'backendなし依頼-固有' "$W/nb/brief.md"
+t "依頼文の報告の決まりが hub-agent notify" grep -q 'hub-agent notify' "$W/nb/brief.md"
+line="$(grep -F '&& claude' "$T/nb" | head -1)"
+t "起動コマンドは worktree で claude を起動する" grep -qF "cd $E/.hub-worktrees/nb/app && claude" "$T/nb"
+(cd / && bash -c "$line" </dev/null)
+A="$T/argv/app.argv"
+t "示したコマンドで起動できる" test -f "$A"
+t "作業の場所の許可を渡す" grep -qxF "Edit(/$W/nb/**)" "$A"
+t "依頼文を最初のプロンプトとして渡す" grep -q 'backendなし依頼-固有' "$A"
+t "list の状態は不明" bash -c "hub-work list | grep -q 'w-nb=不明'"
+t "status は確認できないことを示す" bash -c "hub-status | grep -q 'backend が無いので確認できません'"
+hub-check >"$T/check" 2>&1; rc=$?
+t "check: ずれなし" test "$rc" -eq 0
+t "check: 照合していないことを示す" grep -q '照合していません' "$T/check"
+hub-agent notify 'x' >/dev/null 2>&1; rc=$?
+t "notify は backend が無いことを返す" test "$rc" -eq 3
+hub-agent launch commander --print >"$T/launch" 2>&1
+t "司令塔の起動コマンドに記録の設定がある" grep -q 'commander-agent-settings.json' "$T/launch"
+(cd "$E/app" && hub-agent launch commander </dev/null >/dev/null 2>&1)
+t "司令塔を起動できる" test -f "$T/argv/hub-env.argv"
+t "司令塔のセッションが記録される" bash -c "ls '$T'/state/hub/envs/*/commander-session.json >/dev/null"
+t "finish できる" hub-work finish nb
+t "worktree が消える" test ! -e "$E/.hub-worktrees/nb"
+t "archive へ移る" test -f "$W/archive/nb/status.md"
+cd /
+}
+
 group_install() {
 make_tmp
 echo "# install.sh --env: README"
@@ -764,7 +882,7 @@ t "既存の README を上書きしない" grep -qxF '手元の README' "$I/hub-
 }
 
 # ── 実行 ───────────────────────────────────────────────────
-SUITES=(base ttree parent wtshape blocked trust outer legacy first_setup handoff_fail handoff_blocked handoff_bg resume install)
+SUITES=(base ttree parent wtshape blocked trust outer legacy first_setup handoff_fail handoff_blocked handoff_bg resume notify none install)
 # HUB_TEST_GROUPS="base wtshape" のように、一部のグループだけを流せる
 [[ -n "${HUB_TEST_GROUPS:-}" ]] && read -ra SUITES <<<"$HUB_TEST_GROUPS"
 LOGS="$(mktemp -d /tmp/hubl.XXXXXX)"
