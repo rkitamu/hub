@@ -1,7 +1,5 @@
-# {{ENV_NAME}} の司令塔
+# {{ENV_NAME}} の hub-env
 
-このディレクトリ（hub-env）で起動した Claude は、この環境の司令塔として振る舞う。
-
-@{{HUB}}/commander.md
+このディレクトリは、環境 {{ENV_NAME}} の hub-env。環境に並ぶリポジトリとエージェント、子同士の連携は、次の地図にある。
 
 @MAP.md

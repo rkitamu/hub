@@ -25,9 +25,12 @@ import hub_backend  # noqa: E402
 import hublib  # noqa: E402
 
 
-def load_hub_work():
-    loader = importlib.machinery.SourceFileLoader("hub_work", str(HUB / "scripts/hub-work"))
-    spec = importlib.util.spec_from_loader("hub_work", loader)
+import hub_work  # noqa: E402
+
+
+def load_script(name):
+    loader = importlib.machinery.SourceFileLoader(name.replace("-", "_"), str(HUB / "scripts" / name))
+    spec = importlib.util.spec_from_loader(name.replace("-", "_"), loader)
     module = importlib.util.module_from_spec(spec)
     loader.exec_module(module)
     return module
@@ -39,12 +42,18 @@ class FakeBackend(hub_backend.Backend):
     def __init__(self, env, cfg):
         super().__init__(env, cfg)
         self.calls: list[tuple] = []
-        self.places: dict[str, dict] = {}  # label → {"id", "label"}
-        self.agents: dict[str, dict] = {}
+        self.places: dict[str, dict] = {"hub-env": {"id": "p0", "label": "hub-env"}}
+        self.tabs: dict[str, list[dict]] = {"hub-env": [{"id": "t0", "title": "Commander"}]}
+        self.agents: dict[str, dict] = {"commander": {"name": "commander", "status": "idle", "place": "p0"}}
+        self.layout: dict[str, str] = {}  # ディレクトリ → 場所のラベル
         self.here: str | None = None
+        self.tab_here: str | None = None
         self.send_result = "ok"
         self.problems: list[str] = []
         self.n = 0
+
+    def label_of(self, place_id):
+        return next(l for l, p in self.places.items() if p["id"] == place_id)
 
     def list_agents(self):
         return list(self.agents.values())
@@ -55,15 +64,36 @@ class FakeBackend(hub_backend.Backend):
     def current_place(self):
         return self.here
 
-    def open_place(self, label, cwd, title, worktree=None):
-        self.n += 1
-        self.calls.append(("open_place", label, str(cwd), title, worktree))
-        self.places[label] = {"id": f"p{self.n}", "label": label}
-        return {"place": f"p{self.n}", "pane": f"p{self.n}:root", "data": {"source": {"id": "x", "label": "auto"}} if worktree else {}}
+    def current_tab(self):
+        return self.tab_here
 
-    def add_slot(self, place, cwd, title):
-        self.calls.append(("add_slot", place, str(cwd), title))
-        return f"{place}:slot"
+    def open_place(self, label, cwd, title, worktree=None, env=None):
+        self.n += 1
+        self.calls.append(("open_place", label, str(cwd), title, worktree, env))
+        self.places[label] = {"id": f"p{self.n}", "label": label}
+        self.tabs[label] = [{"id": f"t{self.n}", "title": title}]
+        return {"place": f"p{self.n}", "pane": f"p{self.n}:root", "tab": f"t{self.n}",
+                "data": {"source": {"id": "x", "label": "auto"}} if worktree else {}}
+
+    def add_slot(self, place, cwd, title, env=None):
+        self.n += 1
+        self.calls.append(("add_slot", place, str(cwd), title, env))
+        self.tabs.setdefault(self.label_of(place), []).append({"id": f"t{self.n}", "title": title})
+        return f"{place}:t{self.n}"
+
+    def list_tabs(self, label):
+        return list(self.tabs.get(label, []))
+
+    def close_tab(self, tab):
+        self.calls.append(("close_tab", tab))
+        for tabs in self.tabs.values():
+            tabs[:] = [t for t in tabs if t["id"] != tab]
+
+    def close_tab_later(self, tab):
+        self.calls.append(("close_tab_later", tab))
+
+    def place_for_dir(self, path):
+        return self.layout.get(str(path))
 
     def start_agent(self, pane, spec):
         self.calls.append(("start_agent", pane, spec))
@@ -80,11 +110,12 @@ class FakeBackend(hub_backend.Backend):
 
     def close_place(self, label, worktree=None):
         self.calls.append(("close_place", label, worktree))
+        self.tabs.pop(label, None)
         return self.places.pop(label, None) is not None
 
 
 class WorkEnv(unittest.TestCase):
-    """一時ディレクトリに環境と app リポジトリを作り、hub-work を backend を差し替えて呼べるようにする。"""
+    """一時ディレクトリに環境と app リポジトリを作り、hub-work・hub-lead・hub-crew を backend を差し替えて呼べるようにする。"""
 
     def make_backend(self):
         return FakeBackend(self.env, {})
@@ -96,9 +127,13 @@ class WorkEnv(unittest.TestCase):
         patcher = mock.patch.dict(os.environ)
         patcher.start()
         self.addCleanup(patcher.stop)
+        for k in ("HUB_ROLE", "HUB_WORK"):
+            os.environ.pop(k, None)
         self.env = self.root / "env"
         (self.env / "hub-env").mkdir(parents=True)
-        (self.env / "hub-env/hub.toml").write_text('backend = "herdr"\n[herdr]\nsession = "s"\n')
+        (self.env / "hub-env/hub.toml").write_text(
+            'backend = "herdr"\n[[agent]]\nname = "commander"\ncwd = "hub-env"\n'
+            '[[agent]]\nname = "todo"\ncwd = "app"\n[herdr]\nsession = "s"\n')
         os.environ.update({
             "HUB_ENV": str(self.env), "XDG_STATE_HOME": str(self.root / "state"),
             "CLAUDE_CONFIG_DIR": str(self.root / "claude"),
@@ -111,122 +146,234 @@ class WorkEnv(unittest.TestCase):
         self.app.mkdir()
         self.git("init", "-q", "-b", "main")
         self.git("commit", "-q", "--allow-empty", "-m", "init")
-        self.hw = load_hub_work()
         self.backend = self.make_backend()
-        self.hw.backend_for = lambda env, cfg: self.backend
+        self.scripts = {n: load_script(n) for n in ("hub-work", "hub-lead", "hub-crew")}
+        for m in self.scripts.values():
+            m.backend_for = lambda env, cfg: self.backend
         self.wd = self.env / "hub-env/work"
 
     def git(self, *args, cwd=None):
         return subprocess.run(["git", "-C", str(cwd or self.app), *args], capture_output=True, text=True, check=True)
 
-    def run_cmd(self, *argv):
+    def run_as(self, script, role, work, *argv):
         out, err = io.StringIO(), io.StringIO()
-        with mock.patch.object(sys, "argv", ["hub-work", *argv]), contextlib.redirect_stdout(out), \
-                contextlib.redirect_stderr(err):
-            rc = self.hw.main()
+        env = {k: v for k, v in (("HUB_ROLE", role), ("HUB_WORK", work)) if v}
+        with mock.patch.object(sys, "argv", [script, *argv]), mock.patch.dict(os.environ, env), \
+                contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+            rc = self.scripts[script].main()
         return rc, out.getvalue(), err.getvalue()
 
+    def run_cmd(self, *argv):
+        return self.run_as("hub-work", None, None, *argv)
 
+    def lead(self, work, *argv):
+        return self.run_as("hub-lead", "lead", work, *argv)
 
-class HubWorkTest(WorkEnv):
+    def crew(self, work, *argv):
+        return self.run_as("hub-crew", "crew", work, *argv)
+
     def calls(self, kind):
         return [c for c in self.backend.calls if c[0] == kind]
 
     def meta(self, name, archived=False):
         return hublib.read_status(self.wd / ("archive" if archived else "") / name / "status.md")[0]
 
-    # ── start ──
-
-    def test_start_plain(self):
-        rc, _, err = self.run_cmd("start", "plain", "--repo", "app")
+    def start_assigned(self, name, request="振る指示"):
+        """作業を始め、app に crew を振る。"""
+        self.backend.layout[str(self.app)] = "app"
+        self.backend.places["app"] = {"id": "pa", "label": "app"}
+        self.backend.tabs["app"] = [{"id": "ta", "title": "Shell"}]
+        rc, _, err = self.run_cmd("start", name, "--request", "始める指示")
         self.assertEqual(rc, 0, err)
-        self.assertEqual(self.calls("open_place"), [("open_place", "w-plain", str(self.app), "app", None)])
+        rc, _, err = self.lead(name, "assign", "app", "--request", request)
+        self.assertEqual(rc, 0, err)
+        return self.env / f".hub-worktrees/{name}/app"
+
+
+class StartTest(WorkEnv):
+    def test_start_puts_lead_tab_in_commander_place(self):
+        rc, _, err = self.run_cmd("start", "plain", "--todo", "30", "--request", "依頼の本文")
+        self.assertEqual(rc, 0, err)
+        (_, place, cwd, title, env), = self.calls("add_slot")
+        self.assertEqual((place, cwd, title), ("p0", str((self.env / "hub-env").resolve()), "plain"))
+        self.assertEqual(env, {"HUB_WORK": "plain", "HUB_ROLE": "lead"})
         (_, pane, spec), = self.calls("start_agent")
-        self.assertEqual(pane, "p1:root")
-        self.assertEqual((spec["name"], spec["kind"], spec["cwd"]), ("w-plain", "claude", str(self.app)))
-        self.assertIn(f"Edit(/{self.wd / 'plain'}/**)", spec["argv"])
-        self.assertEqual(self.meta("plain")["agents"][0]["workspace"], "w-plain")
-
-    def test_start_worktree_creates_checkout_in_core(self):
-        rc, _, err = self.run_cmd("start", "tree", "--repo", "app", "--worktree")
-        self.assertEqual(rc, 0, err)
-        tree = self.env / ".hub-worktrees/tree/app"
-        self.assertEqual(self.git("symbolic-ref", "--short", "HEAD", cwd=tree).stdout.strip(), "work/tree")
-        (_, label, cwd, title, wt), = self.calls("open_place")
-        self.assertEqual((label, cwd, title), ("w-tree", str(tree), "app"))
-        self.assertEqual(wt, {"repo": str(self.app), "path": str(tree), "branch": "work/tree"})
-        # backend の data は worktree の記録に残る
-        self.assertEqual(self.meta("tree")["worktrees"][0]["source"], {"id": "x", "label": "auto"})
-
-    def test_start_rejects_existing_place_and_agent(self):
-        self.backend.places["w-dup"] = {"id": "p0", "label": "w-dup"}
-        rc, _, err = self.run_cmd("start", "dup", "--repo", "app")
-        self.assertNotEqual(rc, 0)
-        self.assertIn("ワークスペース", err)
-        self.backend.places.clear()
-        self.backend.agents["w-dup2"] = {"name": "w-dup2"}
-        rc, _, _ = self.run_cmd("start", "dup2", "--repo", "app")
-        self.assertNotEqual(rc, 0)
-        self.assertEqual(self.calls("open_place"), [])
-
-    def test_start_sends_brief(self):
-        rc, _, err = self.run_cmd("start", "req", "--repo", "app", "--request", "依頼の本文")
-        self.assertEqual(rc, 0, err)
+        self.assertEqual(spec["name"], "w-plain")
+        argv = spec["argv"]
+        self.assertIn(f"Edit(/{self.wd / 'plain'}/**)", argv)
+        prompt = Path(argv[argv.index("--append-system-prompt-file") + 1])
+        self.assertIn("# lead の役割", prompt.read_text())
+        settings = json.loads(Path(argv[argv.index("--settings") + 1]).read_text())
+        guard = settings["hooks"]["PreToolUse"][-1]["hooks"][0]["command"]
+        self.assertIn(f"--allow {self.wd / 'plain'}", guard)
+        meta = self.meta("plain")
+        self.assertEqual((meta["workspace"], meta["repos"], meta["todo"]), ("hub-env", [], 30))
+        self.assertEqual(meta["agents"][0]["role"], "lead")
         (_, name, text), = self.calls("send")
-        self.assertEqual(name, "w-req")
+        self.assertEqual(name, "w-plain")
         self.assertIn("依頼の本文", text)
+        self.assertIn("lead", text)
+
+    def test_start_needs_commander(self):
+        del self.backend.agents["commander"]
+        rc, _, err = self.run_cmd("start", "nocmd")
+        self.assertEqual(rc, 1)
+        self.assertIn("herdr-reset", err)
+        self.assertFalse((self.wd / "nocmd").exists())
+
+    def test_start_is_refused_for_lead_and_crew(self):
+        for script_role in ("lead", "crew"):
+            rc, _, err = self.run_as("hub-work", script_role, "x", "start", "y")
+            self.assertEqual(rc, 1)
+            self.assertIn(f"hub-{script_role} を使ってください", err)
+        self.assertEqual(self.calls("add_slot"), [])
+
+    def test_start_rejects_existing_agent_and_tab(self):
+        self.backend.agents["w-dup"] = {"name": "w-dup"}
+        self.assertEqual(self.run_cmd("start", "dup")[0], 1)
+        self.backend.tabs["hub-env"].append({"id": "tx", "title": "dup2"})
+        self.assertEqual(self.run_cmd("start", "dup2")[0], 1)
+        self.assertEqual(self.calls("add_slot"), [])
 
     def test_undelivered_brief_is_saved_without_leaking(self):
         self.backend.send_result = "blocked"
-        rc, _, err = self.run_cmd("start", "blk", "--repo", "app", "--request", "秘密ではない依頼-固有")
+        rc, _, err = self.run_cmd("start", "blk", "--request", "秘密ではない依頼-固有")
         self.assertEqual(rc, 1)
         self.assertIn("blocked", err)
         self.assertNotIn("秘密ではない依頼-固有", err)
-        self.assertIn("秘密ではない依頼-固有", (self.wd / "blk/undelivered-brief.md").read_text())
+        self.assertIn("秘密ではない依頼-固有", (self.wd / "blk/undelivered-w-blk.md").read_text())
 
-    # ── resume ──
 
-    def test_resume_reuses_checkout(self):
-        self.run_cmd("start", "again", "--repo", "app", "--worktree")
-        self.backend.places.clear()
-        self.backend.agents.clear()
-        self.backend.calls.clear()
-        rc, _, err = self.run_cmd("resume", "again")
+class AssignTest(WorkEnv):
+    def test_assign_creates_worktree_and_crew_tab(self):
+        tree = self.start_assigned("tree", "振る指示-固有")
+        self.assertEqual(self.git("symbolic-ref", "--short", "HEAD", cwd=tree).stdout.strip(), "work/tree")
+        _, (_, place, cwd, title, env) = self.calls("add_slot")
+        self.assertEqual((place, cwd, title), ("pa", str(tree), "tree"))
+        self.assertEqual(env, {"HUB_WORK": "tree", "HUB_ROLE": "crew"})
+        spec = self.calls("start_agent")[1][2]
+        self.assertEqual(spec["name"], "w-tree-app")
+        argv = spec["argv"]
+        self.assertIn("# crew の役割", Path(argv[argv.index("--append-system-prompt-file") + 1]).read_text())
+        settings = json.loads(Path(argv[argv.index("--settings") + 1]).read_text())
+        guard = settings["hooks"]["PreToolUse"][-1]["hooks"][0]["command"]
+        self.assertIn(f"--allow {tree} --allow {self.wd / 'tree'}", guard)
+        meta = self.meta("tree")
+        self.assertEqual(meta["repos"], ["app"])
+        self.assertEqual(meta["worktrees"][0]["branch"], "work/tree")
+        self.assertNotIn("created_workspace", meta["worktrees"][0])
+        (_, name, text) = self.calls("send")[1]
+        self.assertEqual(name, "w-tree-app")
+        self.assertIn("振る指示-固有", text)
+        self.assertIn("lead は w-tree", text)
+
+    def test_assign_creates_place_for_repo_outside_layout(self):
+        self.run_cmd("start", "auto")
+        rc, _, err = self.lead("auto", "assign", "app", "--request", "x")
         self.assertEqual(rc, 0, err)
-        self.assertEqual(len(self.calls("open_place")), 1)
-        self.assertEqual(len(self.calls("start_agent")), 1)
-        self.assertEqual(self.git("rev-parse", "--verify", "-q", "refs/heads/work/again").returncode, 0)
+        (_, label, cwd, title, wt, env), = self.calls("open_place")
+        self.assertEqual((label, title, wt, env), ("app", "auto", None, {"HUB_WORK": "auto", "HUB_ROLE": "crew"}))
+        self.assertTrue(self.meta("auto")["worktrees"][0]["created_workspace"])
 
-    def test_resume_is_idempotent(self):
-        self.run_cmd("start", "idem", "--repo", "app")
-        self.backend.calls.clear()
-        rc, _, _ = self.run_cmd("resume", "idem")
-        self.assertEqual(rc, 0)
-        self.assertEqual(self.calls("open_place") + self.calls("start_agent") + self.calls("add_slot"), [])
-
-    def test_resume_adds_slot_when_place_exists(self):
-        self.run_cmd("start", "slot", "--repo", "app")
-        self.backend.agents.clear()
-        self.backend.calls.clear()
-        self.run_cmd("resume", "slot")
-        self.assertEqual(self.calls("add_slot"), [("add_slot", "p1", str(self.app), "app")])
-        self.assertEqual(self.calls("start_agent")[0][1], "p1:slot")
-
-    # ── finish ──
-
-    def test_finish_closes_worktree_then_archives(self):
-        self.run_cmd("start", "fin", "--repo", "app", "--worktree")
-        self.backend.calls.clear()
-        rc, _, err = self.run_cmd("finish", "fin")
+    def test_assign_hub_env_uses_distinct_tab_title(self):
+        hub_env = self.env / "hub-env"
+        self.git("init", "-q", "-b", "main", cwd=hub_env)
+        (hub_env / ".gitignore").write_text("/work/\n")
+        self.git("add", ".", cwd=hub_env)
+        self.git("commit", "-q", "-m", "init", cwd=hub_env)
+        self.backend.layout[str(hub_env.resolve())] = "hub-env"
+        self.run_cmd("start", "henv")
+        rc, _, err = self.lead("henv", "assign", "hub-env", "--request", "地図の変更")
         self.assertEqual(rc, 0, err)
-        self.assertEqual(self.calls("can_close"), [("can_close", {"w-fin"}, {"w-fin"})])
-        (_, label, wt), = self.calls("close_place")
-        self.assertEqual((label, wt["source"]), ("w-fin", {"id": "x", "label": "auto"}))
-        # backend が checkout を消さなくても、core が消す
-        self.assertFalse((self.env / ".hub-worktrees/fin").exists())
-        # 自分のコミットが無いブランチは main に含まれるので消える
+        self.assertEqual(self.calls("add_slot")[1][3], "henv/hub-env")
+
+    def test_assign_same_repo_sends_to_current_crew(self):
+        self.start_assigned("same")
+        self.backend.calls.clear()
+        rc, out, err = self.lead("same", "assign", "app", "--request", "追加の指示-固有")
+        self.assertEqual(rc, 0, err)
+        self.assertEqual(self.calls("add_slot"), [])
+        self.assertEqual(self.calls("send"), [("send", "w-same-app", "追加の指示-固有")])
+        self.assertEqual(len(self.meta("same")["agents"]), 2)
+
+    def test_assign_is_lead_only(self):
+        self.run_cmd("start", "only")
+        rc, _, err = self.run_as("hub-lead", None, "only", "assign", "app", "--request", "x")
+        self.assertEqual(rc, 1)
+        self.assertIn("hub-work を使ってください", err)
+        rc, _, err = self.run_as("hub-lead", "crew", "only", "assign", "app", "--request", "x")
+        self.assertEqual(rc, 1)
+        self.assertIn("hub-crew を使ってください", err)
+
+    def test_lead_send_is_limited_to_own_crew_and_residents(self):
+        self.start_assigned("snd")
+        self.backend.calls.clear()
+        self.assertEqual(self.lead("snd", "send", "w-snd-app", "a")[0], 0)
+        self.assertEqual(self.lead("snd", "send", "todo", "b")[0], 0)
+        rc, _, err = self.lead("snd", "send", "commander", "c")
+        self.assertEqual(rc, 1)
+        self.assertIn("送れません", err)
+        self.assertEqual(self.lead("snd", "send", "w-other-app", "d")[0], 1)
+        self.assertEqual([c[1] for c in self.calls("send")], ["w-snd-app", "todo"])
+
+    def test_notify_goes_to_lead_and_commander(self):
+        self.start_assigned("nt")
+        self.backend.calls.clear()
+        self.assertEqual(self.crew("nt", "notify", "crew の報告")[0], 0)
+        self.assertEqual(self.lead("nt", "notify", "lead の報告")[0], 0)
+        self.assertEqual([c[1] for c in self.calls("send")], ["w-nt", "commander"])
+
+
+class FinishTest(WorkEnv):
+    def test_lead_finish_closes_crews_then_own_tab(self):
+        tree = self.start_assigned("fin")
+        lead_tab = next(t["id"] for t in self.backend.tabs["hub-env"] if t["title"] == "fin")
+        crew_tab = next(t["id"] for t in self.backend.tabs["app"] if t["title"] == "fin")
+        self.backend.tab_here = lead_tab
+        self.backend.calls.clear()
+        rc, _, err = self.lead("fin", "finish")
+        self.assertEqual(rc, 0, err)
+        self.assertEqual(self.calls("close_tab"), [("close_tab", crew_tab)])
+        self.assertEqual(self.calls("close_tab_later"), [("close_tab_later", lead_tab)])
+        self.assertEqual(self.calls("close_place"), [])
+        self.assertFalse(tree.exists())
         self.assertFalse(self.has_branch("work/fin"))
         self.assertEqual(self.meta("fin", archived=True)["state"], "done")
+        self.assertFalse((hublib.env_state_dir(self.env) / "works/fin").exists())
+
+    def test_finish_closes_created_place_when_only_ours(self):
+        self.run_cmd("start", "cp")
+        self.lead("cp", "assign", "app", "--request", "x")
+        self.backend.calls.clear()
+        rc, _, err = self.run_cmd("finish", "cp")
+        self.assertEqual(rc, 0, err)
+        self.assertEqual([c[1] for c in self.calls("close_place")], ["app"])
+        # 司令塔からの finish は lead のタブも閉じる
+        self.assertEqual(len(self.calls("close_tab")), 1)
+        self.assertEqual(self.calls("close_tab_later"), [])
+
+    def test_finish_stops_on_dirty_before_closing(self):
+        tree = self.start_assigned("dirty")
+        (tree / "x").write_text("x")
+        self.backend.calls.clear()
+        rc, _, err = self.lead("dirty", "finish")
+        self.assertEqual(rc, 1)
+        self.assertIn("未コミット", err)
+        self.assertEqual(self.calls("close_tab") + self.calls("close_place"), [])
+        self.assertTrue((self.wd / "dirty/status.md").exists())
+
+    def test_commander_finish_refuses_from_work_tab(self):
+        self.start_assigned("self")
+        self.backend.tab_here = next(t["id"] for t in self.backend.tabs["app"] if t["title"] == "self")
+        rc, _, err = self.run_cmd("finish", "self")
+        self.assertEqual(rc, 1)
+        self.assertIn("hub-lead finish", err)
+
+    def test_crew_cannot_finish(self):
+        self.start_assigned("cf")
+        rc, _, err = self.run_as("hub-lead", "crew", "cf", "finish")
+        self.assertEqual(rc, 1)
+        self.assertTrue((self.wd / "cf/status.md").exists())
 
     # ── finish: 作業ブランチの片付け ──
 
@@ -235,8 +382,7 @@ class HubWorkTest(WorkEnv):
                               capture_output=True).returncode == 0
 
     def start_with_commit(self, name):
-        self.run_cmd("start", name, "--repo", "app", "--worktree")
-        tree = self.env / f".hub-worktrees/{name}/app"
+        tree = self.start_assigned(name)
         self.git("commit", "-q", "--allow-empty", "-m", f"{name} の変更", cwd=tree)
         return tree
 
@@ -300,7 +446,7 @@ class HubWorkTest(WorkEnv):
 
     def test_finish_keeps_branch_when_fetch_fails(self):
         origin = self.add_origin()
-        self.run_cmd("start", "ff", "--repo", "app", "--worktree")
+        self.start_assigned("ff")
         origin.rename(origin.with_name("gone.git"))
         rc, out, err = self.run_cmd("finish", "ff")
         self.assertEqual(rc, 0, err)
@@ -310,7 +456,7 @@ class HubWorkTest(WorkEnv):
 
     def test_finish_reports_squash_merged_pr_and_keeps_branch(self):
         self.start_with_commit("sq")
-        self.hw.merged_pr = lambda repo, branch: "42"
+        self.enterContext(mock.patch.object(hub_work, "merged_pr", lambda repo, branch: "42"))
         rc, out, err = self.run_cmd("finish", "sq")
         self.assertEqual(rc, 0, err)
         self.assertTrue(self.has_branch("work/sq"))
@@ -321,9 +467,9 @@ class HubWorkTest(WorkEnv):
         self.git("merge", "-q", "--no-ff", "-m", "merge", "work/up")
         self.git("config", "branch.work/up.remote", "elsewhere")
         self.git("config", "branch.work/up.merge", "refs/heads/x")
-        real = self.hw.git
-        self.hw.git = lambda cwd, *args, check=True: (subprocess.CompletedProcess(args, 1, "", "拒否-固有")
-                                                       if args[:2] == ("branch", "-d") else real(cwd, *args, check=check))
+        real = hub_work.git
+        self.enterContext(mock.patch.object(hub_work, "git", lambda cwd, *args, check=True: (
+            subprocess.CompletedProcess(args, 1, "", "拒否-固有") if args[:2] == ("branch", "-d") else real(cwd, *args, check=check))))
         rc, out, err = self.run_cmd("finish", "up")
         self.assertEqual(rc, 0, err)
         self.assertTrue(self.has_branch("work/up"))
@@ -331,39 +477,78 @@ class HubWorkTest(WorkEnv):
         self.assertEqual(self.git("config", "branch.work/up.remote").stdout.strip(), "elsewhere")
         self.assertEqual(self.git("config", "branch.work/up.merge").stdout.strip(), "refs/heads/x")
 
-    def test_finish_stops_on_dirty_before_closing(self):
-        self.run_cmd("start", "dirty", "--repo", "app", "--worktree")
-        (self.env / ".hub-worktrees/dirty/app/x").write_text("x")
-        rc, _, err = self.run_cmd("finish", "dirty")
+
+
+class ResumeTest(WorkEnv):
+    def test_commander_resume_rebuilds_lead_and_crew(self):
+        self.start_assigned("again")
+        self.backend.agents = {"commander": self.backend.agents["commander"]}
+        self.backend.calls.clear()
+        rc, _, err = self.run_cmd("resume", "again")
+        self.assertEqual(rc, 0, err)
+        # 古いタブは閉じて作り直す
+        self.assertEqual(len(self.calls("close_tab")), 2)
+        self.assertEqual([c[3] for c in self.calls("add_slot")], ["again", "again"])
+        self.assertEqual({c[2]["name"] for c in self.calls("start_agent")}, {"w-again", "w-again-app"})
+        self.assertIn("再開", self.calls("send")[0][2])
+
+    def test_resume_is_idempotent(self):
+        self.start_assigned("idem")
+        self.backend.calls.clear()
+        rc, _, _ = self.run_cmd("resume", "idem")
+        self.assertEqual(rc, 0)
+        self.assertEqual(self.calls("add_slot") + self.calls("start_agent"), [])
+
+    def test_lead_resume_rebuilds_only_crews(self):
+        self.start_assigned("lr")
+        del self.backend.agents["w-lr-app"]
+        del self.backend.agents["w-lr"]
+        self.backend.calls.clear()
+        rc, _, err = self.lead("lr", "resume")
+        self.assertEqual(rc, 0, err)
+        self.assertEqual([c[2]["name"] for c in self.calls("start_agent")], ["w-lr-app"])
+
+
+class LegacyTest(WorkEnv):
+    """role の無い旧形式の記録は、hub-work の finish と resume だけができる。"""
+
+    def write_legacy(self, name):
+        hub_work.ensure_work_repo(self.env, self.wd)
+        path = self.wd / name / "status.md"
+        path.parent.mkdir()
+        meta = {"state": "active", "todo": None, "repos": ["app"], "workspace": f"w-{name}",
+                "agents": [{"name": f"w-{name}", "repo": "app", "cwd": str(self.app), "workspace": f"w-{name}", "kind": "claude"}],
+                "worktrees": []}
+        hublib.write_status(path, meta, "\n# x\n")
+
+    def test_resume_opens_place_and_finish_closes_it(self):
+        self.write_legacy("old")
+        rc, _, err = self.run_cmd("resume", "old")
+        self.assertEqual(rc, 0, err)
+        self.assertEqual(self.calls("open_place")[0][1], "w-old")
+        self.assertIn("hub-agent notify", self.calls("send")[0][2])
+        self.backend.here = "w-old"
+        self.assertEqual(self.run_cmd("finish", "old")[0], 1)
+        self.backend.here = None
+        rc, _, err = self.run_cmd("finish", "old")
+        self.assertEqual(rc, 0, err)
+        self.assertEqual(self.calls("close_place")[0][1], "w-old")
+
+    def test_lead_cannot_assign_or_finish_legacy(self):
+        self.write_legacy("old2")
+        self.assertEqual(self.lead("old2", "assign", "app", "--request", "x")[0], 1)
+        rc, _, err = self.lead("old2", "finish")
         self.assertEqual(rc, 1)
-        self.assertIn("未コミット", err)
-        self.assertEqual(self.calls("close_place"), [])
+        self.assertIn("hub-work finish old2", err)
 
-    def test_finish_stops_on_backend_problem(self):
-        self.run_cmd("start", "prob", "--repo", "app")
-        self.backend.problems = ["つながっている-固有"]
-        rc, _, err = self.run_cmd("finish", "prob")
-        self.assertEqual(rc, 1)
-        self.assertIn("つながっている-固有", err)
-        self.assertEqual(self.calls("close_place"), [])
-        self.assertTrue((self.wd / "prob/status.md").exists())
 
-    def test_finish_refuses_from_own_place(self):
-        self.run_cmd("start", "self", "--repo", "app")
-        self.backend.here = "w-self"
-        rc, _, err = self.run_cmd("finish", "self")
-        self.assertEqual(rc, 1)
-        self.assertIn("司令塔で実行", err)
-        self.assertEqual(self.calls("close_place"), [])
-
-    # ── list ──
-
+class ListTest(WorkEnv):
     def test_list_shows_backend_status(self):
-        self.run_cmd("start", "ls", "--repo", "app")
+        self.run_cmd("start", "ls")
         rc, out, _ = self.run_cmd("list")
         self.assertEqual(rc, 0)
         self.assertIn("w-ls=idle", out)
-        self.backend.agents.clear()
+        del self.backend.agents["w-ls"]
         _, out, _ = self.run_cmd("list")
         self.assertIn("w-ls=停止", out)
 
@@ -374,30 +559,30 @@ class NoBackendTest(WorkEnv):
     def make_backend(self):
         return hub_backend.NoneBackend(self.env, {})
 
-    def test_start_shows_launch_command_with_brief(self):
-        rc, out, err = self.run_cmd("start", "nb", "--repo", "app", "--worktree", "--request", "依頼-固有")
+    def test_start_and_assign_show_launch_commands(self):
+        rc, out, err = self.run_cmd("start", "nb", "--request", "依頼-固有")
+        self.assertEqual(rc, 0, err)
+        brief = self.wd / "nb/brief-w-nb.md"
+        self.assertIn("依頼-固有", brief.read_text())
+        self.assertIn(f"cd {(self.env / 'hub-env').resolve()} && env HUB_WORK=nb HUB_ROLE=lead claude", out)
+        self.assertIn(f'"$(cat {brief})"', out)
+        rc, out, err = self.lead("nb", "assign", "app", "--request", "振る-固有")
         self.assertEqual(rc, 0, err)
         tree = self.env / ".hub-worktrees/nb/app"
         self.assertTrue(tree.is_dir())
-        brief = self.wd / "nb/brief.md"
-        self.assertIn("依頼-固有", brief.read_text())
-        self.assertIn(f"cd {tree} && claude --allowedTools", out)
-        self.assertIn(f'"$(cat {brief})"', out)
-        self.assertFalse((self.wd / "nb/undelivered-brief.md").exists())
-
-    def test_start_without_request(self):
-        rc, out, _ = self.run_cmd("start", "nr", "--repo", "app")
-        self.assertEqual(rc, 0)
-        self.assertNotIn("$(cat", out)
-        self.assertFalse((self.wd / "nr/brief.md").exists())
+        self.assertIn(f"cd {tree} && env HUB_WORK=nb HUB_ROLE=crew claude", out)
+        self.assertIn("振る-固有", (self.wd / "nb/brief-w-nb-app.md").read_text())
+        self.assertEqual(self.crew("nb", "notify", "x")[0], 3)
 
     def test_list_and_finish(self):
-        self.run_cmd("start", "nf", "--repo", "app", "--worktree")
+        self.run_cmd("start", "nf")
+        self.lead("nf", "assign", "app", "--request", "x")
         _, out, _ = self.run_cmd("list")
         self.assertIn("w-nf=不明", out)
-        rc, _, err = self.run_cmd("finish", "nf")
+        rc, _, err = self.lead("nf", "finish")
         self.assertEqual(rc, 0, err)
         self.assertFalse((self.env / ".hub-worktrees/nf").exists())
+
 
 if __name__ == "__main__":
     unittest.main()

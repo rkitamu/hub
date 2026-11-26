@@ -29,6 +29,14 @@ input_has() { [[ -f "$HI" && "$(cat "$HI")" == *"$1"* ]]; }
 input_count() { [[ "$(grep -c -F -- "$1" "$HI")" == "$2" ]]; }
 ws_id() { herdr workspace list | jq -r --arg l "$1" '.result.workspaces[] | select(.label == $l) | .workspace_id'; }
 tab_ids() { herdr tab list --workspace "$(ws_id "$1")" | jq -c '[.result.tabs[].tab_id]'; }
+tab_titles() { herdr tab list --workspace "$(ws_id "$1")" | jq -r '[.result.tabs[].label] | join(",")'; }
+has_tab() { [[ ",$(tab_titles "$1")," == *",$2,"* ]]; }
+no_tab() { ! has_tab "$1" "$2"; }
+tab_id() { herdr tab list --workspace "$(ws_id "$1")" | jq -r --arg l "$2" '.result.tabs[] | select(.label == $l) | .tab_id'; }
+# lead・crew として実行する: as_lead <作業名> <コマンド>…
+as_lead() { local w="$1"; shift; HUB_ROLE=lead HUB_WORK="$w" "$@"; }
+as_crew() { local w="$1"; shift; HUB_ROLE=crew HUB_WORK="$w" "$@"; }
+screen_has() { herdr agent read "$1" --source recent-unwrapped --lines 200 | grep -qF -- "$2"; }
 # 準備の手順。検査の件数には数えず、失敗したときだけ FAIL を出す
 prep() { if ! "$@" >"$T/prep" 2>&1; then ng "準備: $*"; sed 's/^/       /' "$T/prep"; fi; }
 # 裏で動く herdr-reset が終わったか。裏の実行はログを開いたまま動く
@@ -62,6 +70,7 @@ make_tmp
 cat >"$T/bin/claude" <<'EOF'
 #!/bin/bash
 printf '%s\n' "$@" >"$HUB_TEST_ARGV/$(basename "$PWD").argv"
+env | grep -E '^HUB_(WORK|ROLE)=' | sort >"$HUB_TEST_ARGV/$(basename "$PWD").env"
 # 本物と同じ形の入力で SessionStart フックを実行する。--resume なら同じ ID を使う
 sid="$(cat /proc/sys/kernel/random/uuid)"; settings=""; a=("$@")
 for i in "${!a[@]}"; do
@@ -247,10 +256,10 @@ t "生成物は state ディレクトリにある" bash -c "[[ '$R' == '$T/state
 t "環境の rules が含まれる" grep -q '環境ルール-固有文字列' "$R"
 launch_args() { python3 -c 'import sys; sys.path.insert(0, sys.argv[1]); from pathlib import Path; import hublib; print("\n".join(hublib.claude_launch_args(Path(sys.argv[2]))))' "$HUB/lib" "$E"; }
 no_rules_arg() { local out; out="$(launch_args)" && ! grep -qx -- '--append-system-prompt-file' <<<"$out"; }
-has_rules_arg() { launch_args | grep -qx -- '--append-system-prompt-file' && grep -q '環境ルール-固有文字列' "$R"; }
+has_rules_arg() { launch_args | grep -qx -- '--append-system-prompt-file' && grep -q '環境ルール-固有文字列' "$(dirname "$R")/agent-rules.md"; }
 mv "$E/hub-env/rules/local.md" "$T/local.md"
 t "rules が空なら引数を渡さない" no_rules_arg
-t "rules が空なら生成物を残さない" test ! -e "$R"
+t "rules が空なら常駐エージェント用の生成物を残さない" test ! -e "$(dirname "$R")/agent-rules.md"
 rmdir "$E/hub-env/rules"
 t "rules が無ければ引数を渡さない" no_rules_arg
 mkdir "$E/hub-env/rules"; mv "$T/local.md" "$E/hub-env/rules/local.md"
@@ -264,42 +273,72 @@ cp "$T/settings.bak" "$E/hub-env/agent-settings.json"
 
 
 echo "# hub-work: 検証"
-tn "archive は作業名に使えない" hub-work start archive --repo app
-tn "不正な作業名を拒否する" hub-work start ../evil --repo app
-tn "存在しないリポジトリを拒否する" hub-work start nope --repo missing
-tn "hub-env は --worktree なしでは対象にできない" hub-work start nope --repo hub-env --request x
-tn "hub-env は --request なしでは対象にできない" hub-work start nope --repo hub-env --worktree
+tn "archive は作業名に使えない" hub-work start archive
+tn "不正な作業名を拒否する" hub-work start ../evil
+tn "--repo は受け付けない" hub-work start nope --repo app
+tn "lead からは start できない" as_lead x hub-work start nope
 t "拒否では文書を作らない" test ! -e "$E/hub-env/work/nope"
 
-echo "# hub-work: start / list"
-t "通常の作業を始める" hub-work start plain --repo app --todo 30 --purpose 目的A --request 依頼A
-W="$E/hub-env/work"
+echo "# hub-work start: lead のタブ"
+t "作業を始める" hub-work start plain --todo 30 --purpose 目的A --request 依頼A-固有
 t "status.md ができる" test -f "$W/plain/status.md"
 t "作業ディレクトリは独立した git" test -d "$W/.git"
 t "hub-env の git から外れている" git -C "$E/hub-env" check-ignore -q work/
 t "front matter に state がある" grep -qx 'state: active' "$W/plain/status.md"
 t "本文に目的がある" grep -q '目的A' "$W/plain/status.md"
-t "w-plain ができる" has_ws w-plain
-t "エージェントができる" has_agent w-plain
-tn "同名の作業を拒否する" hub-work start plain --repo app
-t "worktree の作業を始める" hub-work start tree --repo app --worktree
-t "worktree ができる" test -d "$E/.hub-worktrees/tree/app"
-t "作業ブランチができる" git -C "$E/app" rev-parse --verify -q refs/heads/work/tree
-t "list に出る" bash -c 'hub-work list | grep -q "^tree"'
+t "司令塔のワークスペースに作業名のタブができる" has_tab hub-env plain
+t "作業のワークスペースは作らない" no_ws w-plain
+t "lead が起動する" has_agent w-plain
+t "lead に依頼が届く" wait_for screen_has w-plain 依頼A-固有
+t "lead に HUB_WORK と HUB_ROLE を渡す" bash -c "grep -qx HUB_ROLE=lead '$T/argv/hub-env.env' && grep -qx HUB_WORK=plain '$T/argv/hub-env.env'"
+A="$T/argv/hub-env.argv"
+t "lead に作業の場所を許可する" grep -qxF "Edit(/$W/plain/**)" "$A"
+LP="$(grep -A1 -- '--append-system-prompt-file' "$A" | tail -1)"
+t "lead に役割のファイルを渡す" grep -q '# lead の役割' "$LP"
+t "lead の役割に rules も入る" grep -q '環境ルール-固有文字列' "$LP"
+LS="$(grep -A1 -- '--settings' "$A" | tail -1)"
+t "lead の設定は agent-settings のフックを保つ" jq -e '.hooks.PreToolUse[0].matcher == "Bash"' "$LS"
+t "lead の書き込みを作業の場所に限る" jq -e --arg d "--allow $W/plain" '.hooks.PreToolUse[1].hooks[0].command | endswith($d)' "$LS"
+tn "同名の作業を拒否する" hub-work start plain
+t "list に出る" bash -c 'hub-work list | grep -q "^plain"'
 
-echo "# hub-work: 作業ディレクトリと権限"
+echo "# hub-lead assign: crew のタブと worktree"
+tn "commander からは assign できない" hub-lead assign app --request x
+tn "crew からは assign できない" as_crew plain hub-lead assign app --request x
+tn "存在しないリポジトリは拒否する" as_lead plain hub-lead assign missing --request x
+t "app に crew を振る" as_lead plain hub-lead assign app --request 振る指示-固有
+t "worktree ができる" test -d "$E/.hub-worktrees/plain/app"
+t "作業ブランチができる" git -C "$E/app" rev-parse --verify -q refs/heads/work/plain
+t "子のワークスペースに作業名のタブができる" has_tab app plain
+t "crew が起動する" has_agent w-plain-app
+t "crew に指示が届く" wait_for screen_has w-plain-app 振る指示-固有
+t "crew に HUB_ROLE=crew を渡す" grep -qx HUB_ROLE=crew "$T/argv/app.env"
+CA="$T/argv/app.argv"
+t "crew に役割のファイルを渡す" grep -q '# crew の役割' "$(grep -A1 -- '--append-system-prompt-file' "$CA" | tail -1)"
+CS="$(grep -A1 -- '--settings' "$CA" | tail -1)"
+t "crew の書き込みを worktree と作業の場所に限る" jq -e --arg d "--allow $E/.hub-worktrees/plain/app --allow $W/plain" '.hooks.PreToolUse[1].hooks[0].command | endswith($d)' "$CS"
+tn "work 全体は許可しない" grep -qxF "Edit(/$W/**)" "$CA"
+t "status.md に crew が記録される" grep -q '"role": "crew"' "$W/plain/status.md"
+t "同じリポジトリへの assign は今の crew に送る" as_lead plain hub-lead assign app --request 追加の指示-固有
+t "追加の指示が届く" wait_for screen_has w-plain-app 追加の指示-固有
+t "crew は 1 人のまま" test "$(grep -o '"role": "crew"' "$W/plain/status.md" | wc -l)" -eq 1
+
+echo "# 役割ごとのコマンド"
+t "crew は lead に通知する" as_crew plain hub-crew notify "crew の報告-固有"
+t "lead に届く" wait_for screen_has w-plain "crew の報告-固有"
+tn "lead は hub-crew を使えない" as_lead plain hub-crew notify x
+t "lead は自分の crew に送れる" as_lead plain hub-lead send w-plain-app "lead の指示-固有"
+t "lead は常駐エージェントに送れる" as_lead plain hub-lead send todo "lead から todo へ"
+tn "lead は commander に send できない" as_lead plain hub-lead send "$CMDR" x
+t "lead は crew の画面を読める" bash -c "HUB_ROLE=lead HUB_WORK=plain hub-lead read w-plain-app | grep -q 'lead の指示-固有'"
+t "lead は自分の作業の一覧を見られる" bash -c "HUB_ROLE=lead HUB_WORK=plain hub-lead list | grep -q '^w-plain-app'"
+tn "crew は hub-agent send を使えない" as_crew plain hub-agent send todo x
+t "crew も hub-agent list は使える" as_crew plain hub-agent list
+tn "lead は herdr-reset を使えない" as_lead plain herdr-reset app
+t "lead の herdr-reset では何も閉じない" has_agent w-plain-app
+
+echo "# hub-work: 作業ディレクトリ"
 t "start は runbook.md を作らない" test ! -e "$W/plain/runbook.md"
-t "start は data/ を作らない" test ! -e "$W/plain/data"
-A="$T/argv/app.argv"
-t "worktree の作業に自分の場所を許可" grep -qxF "Edit(/$W/tree/**)" "$A"
-t "Write も許可" grep -qxF "Write(/$W/tree/**)" "$A"
-t "Read も許可" grep -qxF "Read(/$W/tree/**)" "$A"
-tn "--add-dir は使わない" grep -qx -- '--add-dir' "$A"
-tn "他の作業の場所は許可しない" grep -qF "$W/plain" "$A"
-tn "work 全体は許可しない" grep -qxF "Edit(/$W/**)" "$A"
-t "作業エージェントにも rules を渡す" grep -qx -- '--append-system-prompt-file' "$A"
-t "hub 以外には agent-settings をそのまま渡す" grep -qx -- "$E/hub-env/agent-settings.json" "$A"
-tn "hub 以外には記録フックの設定を渡さない" grep -q "$CMDR-agent-settings" "$A"
 mkdir -p "$W/plain/data"; echo secret >"$W/plain/data/x.csv"; echo memo >"$W/plain/runbook.md"
 t "data/ は git から外れる" git -C "$W" check-ignore -q plain/data/x.csv
 tn "runbook.md は外れない" git -C "$W" check-ignore -q plain/runbook.md
@@ -310,7 +349,7 @@ tn "作業名 data の文書は外れない" git -C "$W" check-ignore -q archive
 echo "# hub-status / hub-check"
 hub-status >"$T/status" 2>&1
 t "status: エージェント" grep -q '^w-plain' "$T/status"
-t "status: 作業" grep -q '^tree' "$T/status"
+t "status: 作業" grep -q '^plain' "$T/status"
 t "status: 近い TODO を出す" grep -q '#30' "$T/status"
 tn "status: 遠い TODO は出さない" grep -q '#31' "$T/status"
 echo dirty >"$E/app/dirty.txt"
@@ -319,56 +358,72 @@ rm "$E/app/dirty.txt"
 t "check: ずれなし" hub-check
 sed -i '/`app` | 稼働/d' "$E/hub-env/MAP.md"
 tn "check: MAP の抜けを検出する" hub-check
-git -C "$E/app" status >/dev/null
 printf '| `app` | 稼働 | アプリ | - |\n' >"$T/row"
 sed -i "/\`todo\` | 稼働/r $T/row" "$E/hub-env/MAP.md"
 t "check: 直すと通る" hub-check
 
-echo "# hub-work: finish"
-echo x >"$E/.hub-worktrees/tree/app/dirty"
-tn "未コミットの変更があれば止める" hub-work finish tree
-t "止めたとき worktree は残る" test -f "$E/.hub-worktrees/tree/app/dirty"
-t "止めたときワークスペースは残る" has_ws w-tree
-t "止めたときエージェントは残る" has_agent w-tree
-t "止めたとき archive へ移さない" test ! -e "$W/archive/tree"
-rm "$E/.hub-worktrees/tree/app/dirty"
-prep git -C "$E/.hub-worktrees/tree/app" commit -q --allow-empty -m 未マージの変更
-hub-work finish tree >"$T/finish-tree" 2>&1; rc=$?
-t "tree を finish できる" test "$rc" -eq 0
-t "worktree が消える" test ! -e "$E/.hub-worktrees/tree"
-t "マージされていないブランチは残る" git -C "$E/app" rev-parse --verify -q refs/heads/work/tree
-t "残した理由を表示する" grep -q 'work/tree は main にマージされていないので残しています' "$T/finish-tree"
-t "archive へ移る" test -f "$W/archive/tree/status.md"
-t "archive の state は done" grep -qx 'state: done' "$W/archive/tree/status.md"
-t "他の作業は残る" has_agent w-plain
-tn "archive 内と同名を拒否する" hub-work start tree --repo app
-echo "# hub-work: resume（herdr-reset の後）"
-t "worktree の作業を始める" hub-work start again --repo app --worktree
-t "worktree があっても全体リセットできる" herdr-reset
-t "リセットで作業のワークスペースが閉じる" no_ws w-again
-t "リセットしても checkout は残る" test -d "$E/.hub-worktrees/again/app"
-t "worktree の作業を立て直す" hub-work resume again
-t "ワークスペースが戻る" has_ws w-again
-t "エージェントが戻る" has_agent w-again
-t "通常の作業を立て直す" hub-work resume plain
-t "通常の作業のエージェントが戻る" has_agent w-plain
-t "resume は冪等" hub-work resume again
-t "二重に作らない" count_ws w-again 1
-prep git -C "$E/.hub-worktrees/again/app" commit -q --allow-empty -m マージする変更
-prep git -C "$E/app" merge -q --no-ff -m merge work/again
-hub-work finish again >"$T/finish-again" 2>&1; rc=$?
-t "again を finish できる" test "$rc" -eq 0
-tn "main にマージ済みのブランチは消える" git -C "$E/app" rev-parse --verify -q refs/heads/work/again
-t "消したことを表示する" grep -q 'work/again を消しました' "$T/finish-again"
-hub-work finish plain >"$T/finish-plain" 2>&1; rc=$?
-t "plain を finish できる" test "$rc" -eq 0
-t "finish が棚卸しを促す" grep -q '棚卸し' "$T/finish-plain"
+echo "# herdr-reset: 部分リセットは作業のタブを残す"
+t "app を作り直せる" herdr-reset app
+t "crew のタブが残る" has_tab app plain
+t "crew が残る" has_agent w-plain-app
+t "hub.toml のタブは後ろに作り直す" test "$(tab_titles app)" = "plain,app"
+t "hub-env を作り直せる" herdr-reset hub-env
+t "lead のタブが残る" has_tab hub-env plain
+t "lead が残る" has_agent w-plain
+t "司令塔は作り直される" wait_for has_agent "$CMDR"
+
+echo "# hub-lead finish"
+echo x >"$E/.hub-worktrees/plain/app/dirty"
+tn "未コミットの変更があれば止める" as_lead plain hub-lead finish
+t "止めたとき worktree は残る" test -f "$E/.hub-worktrees/plain/app/dirty"
+t "止めたとき crew のタブは残る" has_tab app plain
+t "止めたとき archive へ移さない" test ! -e "$W/archive/plain"
+rm "$E/.hub-worktrees/plain/app/dirty"
+prep git -C "$E/.hub-worktrees/plain/app" commit -q --allow-empty -m 未マージの変更
+LT="$(tab_id hub-env plain)"
+HERDR_TAB_ID="$LT" HUB_ROLE=lead HUB_WORK=plain hub-lead finish >"$T/finish-plain" 2>&1; rc=$?
+t "lead が自分の作業を閉じられる" test "$rc" -eq 0
+t "crew のタブが閉じる" no_tab app plain
+t "crew がいなくなる" wait_for no_agent w-plain-app
+t "worktree が消える" test ! -e "$E/.hub-worktrees/plain"
+t "マージされていないブランチは残る" git -C "$E/app" rev-parse --verify -q refs/heads/work/plain
+t "残した理由を表示する" grep -q 'work/plain は main にマージされていないので残しています' "$T/finish-plain"
+t "archive へ移る" test -f "$W/archive/plain/status.md"
+t "archive の state は done" grep -qx 'state: done' "$W/archive/plain/status.md"
 t "runbook.md も archive へ移る" test -f "$W/archive/plain/runbook.md"
 t "data/ も archive へ移る" test -f "$W/archive/plain/data/x.csv"
 t "runbook.md はコミットされる" git -C "$W" ls-files --error-unmatch archive/plain/runbook.md
 tn "data/ はコミットされない" git -C "$W" ls-files --error-unmatch archive/plain/data/x.csv
-t "plain のワークスペースが閉じる" no_ws w-plain
-t "作業文書がコミットされる" bash -c "git -C '$W' log --oneline | grep -q 'finish plain'"
+t "最後に lead のタブが裏で閉じる" wait_for no_tab hub-env plain
+t "司令塔は残る" has_agent "$CMDR"
+tn "archive 内と同名を拒否する" hub-work start plain
+
+echo "# hub-work resume（全体リセットの後）"
+t "作業を始める" hub-work start again
+t "crew を振る" as_lead again hub-lead assign app --request x
+t "全体リセットできる" herdr-reset
+t "全体リセットで作業のタブも閉じる" no_tab hub-env again
+t "リセットしても checkout は残る" test -d "$E/.hub-worktrees/again/app"
+t "司令塔が立て直す" hub-work resume again
+t "lead のタブが戻る" has_tab hub-env again
+t "crew のタブが戻る" has_tab app again
+t "lead が戻る" has_agent w-again
+t "crew が戻る" has_agent w-again-app
+t "resume は冪等" hub-work resume again
+t "タブを二重に作らない" test "$(tab_titles app | tr , '\n' | grep -cx again)" -eq 1
+prep herdr tab close "$(tab_id app again)"
+wait_for no_agent w-again-app
+t "lead は欠けた crew を立て直せる" as_lead again hub-lead resume
+t "crew が戻る（lead から）" has_agent w-again-app
+prep git -C "$E/.hub-worktrees/again/app" commit -q --allow-empty -m マージする変更
+prep git -C "$E/app" merge -q --no-ff -m merge work/again
+hub-work finish again >"$T/finish-again" 2>&1; rc=$?
+t "司令塔からも finish できる（予備）" test "$rc" -eq 0
+tn "main にマージ済みのブランチは消える" git -C "$E/app" rev-parse --verify -q refs/heads/work/again
+t "消したことを表示する" grep -q 'work/again を消しました' "$T/finish-again"
+t "lead のタブも閉じる" no_tab hub-env again
+t "crew のタブも閉じる" no_tab app again
+t "作業文書がコミットされる" bash -c "git -C '$W' log --oneline | grep -q 'finish again'"
 }
 
 group_ttree() {
@@ -382,37 +437,36 @@ t "ワークスペースが新しくなる" test "$old" != "$new"
 t "todo は 1 つのまま" count_ws todo 1
 t "todo エージェントが戻る" has_agent todo
 t "他のワークスペースは残る" has_ws app
-echo "# herdr-reset: worktree がつながった状態"
-t "todo に worktree の作業を始める" hub-work start ttree --repo todo --worktree
+echo "# herdr-reset: setup のワークスペースに作業のタブがある"
+t "作業を始める" hub-work start ttree
+t "todo に crew を振る" as_lead ttree hub-lead assign todo --request x
+t "todo に crew のタブができる" has_tab todo ttree
 herdr-reset todo >"$T/reset" 2>&1; rc=$?
-t "単体リセットは他の作業を巻き込まず止まる（setup + worktree）" test "$rc" -ne 0
-t "止まる理由が worktree のつながり" grep -q 'つながっています' "$T/reset"
-t "止まった後も todo は残る" has_ws todo
-t "止まった後も worktree の作業は残る" has_ws w-ttree
+t "setup の単体リセットは作業を巻き込まず止まる" test "$rc" -ne 0
+t "止まる理由が作業のタブ" grep -q '作業のタブ（ttree）があります' "$T/reset"
+t "止まった後も crew は残る" has_agent w-ttree-todo
 t "ttree を片付ける" hub-work finish ttree
+t "片付けた後は作り直せる" herdr-reset todo
 }
 
 group_parent() {
 make_env
 prep herdr-reset
-echo "# hub-work: 親になったワークスペース"
+echo "# hub-lead assign: hub.toml にワークスペースの無いリポジトリ"
 mkdir "$E/solo" && git -C "$E/solo" init -q -b main && git -C "$E/solo" commit -q --allow-empty -m init
-t "solo で通常の作業を始める" hub-work start psolo --repo solo
-t "solo で worktree の作業を始める" hub-work start tsolo --repo solo --worktree
-hub-work finish psolo >"$T/finish" 2>&1; rc=$?
-t "親の作業の finish は止まる" test "$rc" -ne 0
-t "止まる理由が worktree のつながり" grep -q 'つながっている' "$T/finish"
-t "親のワークスペースは残る" has_ws w-psolo
-t "つながった作業は無事" has_agent w-tsolo
-t "子を先に finish できる" hub-work finish tsolo
-t "その後で親を finish できる" hub-work finish psolo
-
-echo "# hub-work: herdr が自動で作る親"
-t "元のワークスペースが無いリポジトリで worktree の作業を始める" hub-work start auto --repo solo --worktree
-t "herdr が親を自動で作る" has_ws solo
-t "親が status.md に記録される" grep -q '"source"' "$W/auto/status.md"
-t "finish できる" hub-work finish auto
-t "自動で作られた親も閉じる" no_ws solo
+t "作業を始める" hub-work start psolo
+t "solo に crew を振る" as_lead psolo hub-lead assign solo --request x
+t "ワークスペース solo を作る" has_ws solo
+t "作ったことを記録する" grep -q '"created_workspace": true' "$W/psolo/status.md"
+prep hub-work start tsolo
+t "同じ solo に別の作業も振れる" as_lead tsolo hub-lead assign solo --request y
+t "solo は 1 つのまま" count_ws solo 1
+hub-check >"$T/check" 2>&1
+tn "check: 作業が作ったワークスペースはずれに数えない" grep -q 'ワークスペース solo' "$T/check"
+t "先の作業を閉じる" hub-work finish psolo
+t "他の作業のタブがあれば solo は残す" has_ws solo
+t "後の作業を閉じる" hub-work finish tsolo
+t "作業のタブが無くなれば solo を閉じる" no_ws solo
 rm -rf "$E/solo"
 }
 
@@ -427,9 +481,10 @@ if [[ "\$1 \$2" == "agent prompt" ]]; then echo '{"error":{"code":"agent_blocked
 exec "$(command -v herdr)" "\$@"
 EOF
 chmod +x "$T/failbin/herdr"
-PATH="$T/failbin:$PATH" hub-work start blocked --repo app --request 消えてはいけない依頼 >"$T/blocked" 2>&1; rc=$?
+PATH="$T/failbin:$PATH" hub-work start blocked --request 消えてはいけない依頼 >"$T/blocked" 2>&1; rc=$?
 t "届かなければ失敗を返す" test "$rc" -ne 0
-t "再送のコマンドを示す" grep -q 'hub-agent send w-blocked' "$T/blocked"
+t "再送のコマンドを示す" grep -q 'herdr agent prompt w-blocked' "$T/blocked"
+t "依頼文を作業の場所に残す" grep -q '消えてはいけない依頼' "$W/blocked/undelivered-w-blocked.md"
 t "依頼文が status.md に残る" grep -q '消えてはいけない依頼' "$W/blocked/status.md"
 t "エージェントは残る" has_agent w-blocked
 t "blocked を片付ける" hub-work finish blocked
@@ -443,7 +498,8 @@ CJ="$T/claude/.claude.json"
 RE="$(cd "$E" && pwd -P)"
 trusted() { jq -e --arg p "$1" '.projects[$p].hasTrustDialogAccepted == true' "$CJ" >/dev/null; }
 jq --arg p "$RE/app" '.projects[$p] = {hasTrustDialogAccepted: true} | .keep = 1' "$CJ" >"$CJ.new" && mv "$CJ.new" "$CJ"
-t "信頼済みのリポジトリで worktree の作業を始める" hub-work start trusta --repo app --worktree
+prep hub-work start trusta
+t "信頼済みのリポジトリに crew を振る" as_lead trusta hub-lead assign app --request x
 t "worktree が信頼済みになる" trusted "$RE/.hub-worktrees/trusta/app"
 t "他の設定を保つ" jq -e '.keep == 1' "$CJ"
 A="$T/argv/app.argv"
@@ -451,12 +507,14 @@ tn "git と gh の自動許可を持たない" grep -qE '^Bash\((git|gh) ' "$A"
 t "trusta を片付ける" hub-work finish trusta
 tn "finish で信頼の登録を外す" trusted "$RE/.hub-worktrees/trusta/app"
 mkdir "$E/plainrepo" && git -C "$E/plainrepo" init -q -b main && git -C "$E/plainrepo" commit -q --allow-empty -m init
-hub-work start trustb --repo plainrepo --worktree >"$T/trustb" 2>&1
+prep hub-work start trustb
+as_lead trustb hub-lead assign plainrepo --request x >"$T/trustb" 2>&1
 t "未信頼のリポジトリは警告する" grep -q '信頼済みではありません' "$T/trustb"
 tn "未信頼のリポジトリの worktree は登録しない" trusted "$RE/.hub-worktrees/trustb/plainrepo"
 t "trustb を片付ける" hub-work finish trustb
+prep hub-work start trustc
 mkdir "$CJ.lock"
-hub-work start trustc --repo app --worktree >"$T/trustc" 2>&1
+as_lead trustc hub-lead assign app --request x >"$T/trustc" 2>&1
 rmdir "$CJ.lock"
 t "登録できないときは警告する" grep -q '信頼済みにできませんでした' "$T/trustc"
 tn "登録できないときは書かない" trusted "$RE/.hub-worktrees/trustc/app"
@@ -470,23 +528,26 @@ prep herdr-reset
 echo "# hub-work: hub-env と環境の外のリポジトリ"
 mkdir -p "$T/outside/hub" && git -C "$T/outside/hub" init -q -b main && git -C "$T/outside/hub" commit -q --allow-empty -m init
 git -C "$E/hub-env" add -A >/dev/null && git -C "$E/hub-env" commit -q -m init
-t "hub-env を worktree で対象にできる" hub-work start henv --repo hub-env --worktree --request 地図の変更
+prep hub-work start henv
+t "hub-env に crew を振れる" as_lead henv hub-lead assign hub-env --request 地図の変更
 t "hub-env の worktree ができる" test -f "$E/.hub-worktrees/henv/hub-env/.git"
-t "役割を依頼文で渡す" bash -c "herdr agent read w-henv --source recent-unwrapped --lines 40 | grep -q 司令塔ではなく"
+t "lead と同じワークスペースでは crew のタブ名を分ける" has_tab hub-env henv/hub-env
+t "crew の役割を環境変数で渡す" grep -qx HUB_ROLE=crew "$T/argv/hub-env.env"
 t "henv を片付ける" hub-work finish henv
-t "環境の外の hub を対象にできる" hub-work start outer --repo ../outside/hub --worktree
+t "lead のタブを閉じる" no_tab hub-env henv
+t "crew のタブを閉じる" no_tab hub-env henv/hub-env
+prep hub-work start outer
+t "環境の外の hub に crew を振れる" as_lead outer hub-lead assign ../outside/hub --request x
 t "環境の外の worktree ができる" test -f "$E/.hub-worktrees/outer/hub/.git"
+tn "存在しない外のパスは拒否する" as_lead outer hub-lead assign ../outside/none --request x
 t "outer を片付ける" hub-work finish outer
-t "環境の外の hub を worktree なしで対象にできる" hub-work start outerb --repo ../outside/hub
-t "outerb を片付ける" hub-work finish outerb
-tn "存在しない外のパスは拒否する" hub-work start outerc --repo ../outside/none
 }
 
 group_legacy() {
 make_env
 prep herdr-reset
 echo "# hub-work: 既存の work リポジトリ"
-t "古い形の作業を始める" hub-work start legacy --repo app
+t "作業を始める" hub-work start legacy
 mkdir "$W/legacy/data"; echo old >"$W/legacy/data/old.csv"
 cp "$W/.gitignore" "$T/ignore.bak"; : >"$W/.gitignore"
 git -C "$W" add -A && git -C "$W" commit -q -m "old style"
@@ -704,46 +765,48 @@ t "--help に --resume がある" bash -c 'herdr-reset --help | grep -q -- --res
 group_wtshape() {
 make_env
 prep herdr-reset
-echo "# hub-work: herdr の worktree のまとまり方"
+echo "# hub-work: ワークスペースとタブの形"
 mkdir "$E/solo" && git -C "$E/solo" init -q -b main && git -C "$E/solo" commit -q --allow-empty -m init
-# ワークスペースの並び・worktree の種類（main / linked）・元のリポジトリ・checkout・タブを、一時ディレクトリを伏せて出す
+# ワークスペースの並びと、それぞれのタブを出す
 shape() {
-  herdr workspace list | jq -r '.result.workspaces[] | [.workspace_id, .label, (if .worktree then (if .worktree.is_linked_worktree then "linked" else "main" end) + " " + .worktree.repo_name + " " + .worktree.checkout_path else "-" end), .pane_count] | @tsv' |
-    while IFS=$'\t' read -r id label wt panes; do
-      printf '%s\t%s\t%s\t%s\n' "$label" "${wt//$T/T}" "$(herdr tab list --workspace "$id" | jq -r '[.result.tabs[].label] | join(",")')" "$panes"
+  herdr workspace list | jq -r '.result.workspaces[] | [.workspace_id, .label] | @tsv' |
+    while IFS=$'\t' read -r id label; do
+      printf '%s\t%s\n' "$label" "$(herdr tab list --workspace "$id" | jq -r '[.result.tabs[].label] | join(",")')"
     done
 }
 same_shape() { diff <(shape) - >"$T/shape.diff" || { cat "$T/shape.diff"; return 1; }; }
-t "親のあるリポジトリで worktree の作業を始める" hub-work start wa --repo app --worktree
-t "親の無いリポジトリを含む worktree の作業を始める" hub-work start wb --repo solo --repo app --worktree
-t "自動で作られた親が記録される" grep -q '"source"' "$W/wb/status.md"
-t "start 後のまとまり方" same_shape <<EOF
-hub-env	-	Claude	1
-todo	-	1	3
-app	main app T/env/app	app	1
-w-wa	linked app T/env/.hub-worktrees/wa/app	app	1
-solo	main solo T/env/solo	1	1
-w-wb	linked solo T/env/.hub-worktrees/wb/solo	solo	1
-w-wb--app	linked app T/env/.hub-worktrees/wb/app	app	1
+t "作業を始める" hub-work start wa
+t "app に振る" as_lead wa hub-lead assign app --request x
+t "solo に振る" as_lead wa hub-lead assign solo --request y
+t "相談だけの作業を始める" hub-work start wb
+t "start と assign 後の形" same_shape <<EOF
+hub-env	Claude,wa,wb
+todo	1
+app	app,wa
+solo	wa
 EOF
 prep herdr-reset
-t "既存の checkout から立て直す" hub-work resume wb
-t "resume 後のまとまり方" same_shape <<EOF
-hub-env	-	Claude	1
-todo	-	1	3
-app	main app T/env/app	app	1
-solo	main solo T/env/solo	1	1
-w-wb	linked solo T/env/.hub-worktrees/wb/solo	solo	1
-w-wb--app	linked app T/env/.hub-worktrees/wb/app	app	1
+t "全体リセット後の形" same_shape <<EOF
+hub-env	Claude
+todo	1
+app	app
 EOF
-t "wb を finish できる" hub-work finish wb
+t "wa を立て直す" hub-work resume wa
+t "wb を立て直す" hub-work resume wb
+t "resume 後の形" same_shape <<EOF
+hub-env	Claude,wa,wb
+todo	1
+app	app,wa
+solo	wa
+EOF
 t "wa を finish できる" hub-work finish wa
-t "finish 後のまとまり方" same_shape <<EOF
-hub-env	-	Claude	1
-todo	-	1	3
-app	main app T/env/app	app	1
+t "wb を finish できる" hub-work finish wb
+t "finish 後の形" same_shape <<EOF
+hub-env	Claude
+todo	1
+app	app
 EOF
-t "checkout が消える" test ! -e "$E/.hub-worktrees/wb"
+t "checkout が消える" test ! -e "$E/.hub-worktrees/wa"
 t "worktree の登録が残らない" bash -c "! git -C '$E/app' worktree list | grep -q hub-worktrees && ! git -C '$E/solo' worktree list | grep -q hub-worktrees"
 }
 
@@ -772,6 +835,8 @@ t "起動コマンドに agent の args がある" grep -q -- 'test-model' "$T/l
 t "司令塔の起動コマンドに記録の設定がある" grep -q -- "$CMDR-agent-settings.json" "$T/launch"
 t "起動コマンドに rules がある" grep -q -- '--append-system-prompt-file' "$T/launch"
 tn "知らないエージェントは起動しない" hub-agent launch nobody --print
+t "司令塔に役割のファイルを渡す" grep -q '# 司令塔（commander）の役割' "$(grep -A1 -- '--append-system-prompt-file' "$T/argv/hub-env.argv" | tail -1)"
+tn "lead は hub-agent notify を使えない" as_lead x hub-agent notify x
 }
 
 group_none() {
@@ -779,6 +844,7 @@ make_tmp
 cat >"$T/bin/claude" <<'EOF'
 #!/bin/bash
 printf '%s\n' "$@" >"$HUB_TEST_ARGV/$(basename "$PWD").argv"
+env | grep -E '^HUB_(WORK|ROLE)=' | sort >"$HUB_TEST_ARGV/$(basename "$PWD").env"
 settings=""; a=("$@")
 for i in "${!a[@]}"; do [[ "${a[$i]}" == --settings ]] && settings="${a[$((i + 1))]}"; done
 if [[ -n "$settings" ]]; then
@@ -819,20 +885,26 @@ EOF
 echo "$E" >"$T/config/hub/envs"
 cd "$E/hub-env"
 echo "# backend なし（herdr を使わない）"
-hub-work start nb --repo app --worktree --request 'backendなし依頼-固有' >"$T/nb" 2>&1; rc=$?
+hub-work start nb --request 'backendなし依頼-固有' >"$T/nb" 2>&1; rc=$?
 t "作業を始められる" test "$rc" -eq 0
-t "worktree ができる" test -d "$E/.hub-worktrees/nb/app"
 t "status.md ができる" test -f "$W/nb/status.md"
 t "起動していないことを知らせる" grep -q 'backend が無いので' "$T/nb"
-t "依頼文を brief.md に残す" grep -q 'backendなし依頼-固有' "$W/nb/brief.md"
-t "依頼文の報告の決まりが hub-agent notify" grep -q 'hub-agent notify' "$W/nb/brief.md"
-line="$(grep -F '&& claude' "$T/nb" | head -1)"
-t "起動コマンドは worktree で claude を起動する" grep -qF "cd $E/.hub-worktrees/nb/app && claude" "$T/nb"
+t "依頼文を brief に残す" grep -q 'backendなし依頼-固有' "$W/nb/brief-w-nb.md"
+HE="$(cd "$E/hub-env" && pwd)"
+t "起動コマンドは hub-env で lead を起動する" grep -qF "cd $HE && env HUB_WORK=nb HUB_ROLE=lead claude" "$T/nb"
+line="$(grep -F '&& env HUB_WORK' "$T/nb" | head -1)"
 (cd / && bash -c "$line" </dev/null)
-A="$T/argv/app.argv"
+A="$T/argv/hub-env.argv"
 t "示したコマンドで起動できる" test -f "$A"
+t "lead に役割が渡る" grep -qx HUB_ROLE=lead "$T/argv/hub-env.env"
 t "作業の場所の許可を渡す" grep -qxF "Edit(/$W/nb/**)" "$A"
 t "依頼文を最初のプロンプトとして渡す" grep -q 'backendなし依頼-固有' "$A"
+as_lead nb hub-lead assign app --request 'crew依頼-固有' >"$T/nba" 2>&1; rc=$?
+t "crew を振れる" test "$rc" -eq 0
+t "worktree ができる" test -d "$E/.hub-worktrees/nb/app"
+t "起動コマンドは worktree で crew を起動する" grep -qF "cd $E/.hub-worktrees/nb/app && env HUB_WORK=nb HUB_ROLE=crew claude" "$T/nba"
+as_crew nb hub-crew notify x >/dev/null 2>&1; rc=$?
+t "crew の notify は backend が無いことを返す" test "$rc" -eq 3
 t "list の状態は不明" bash -c "hub-work list | grep -q 'w-nb=不明'"
 t "status は確認できないことを示す" bash -c "hub-status | grep -q 'backend が無いので確認できません'"
 hub-check >"$T/check" 2>&1; rc=$?
@@ -845,7 +917,7 @@ t "司令塔の起動コマンドに記録の設定がある" grep -q 'commander
 (cd "$E/app" && hub-agent launch commander </dev/null >/dev/null 2>&1)
 t "司令塔を起動できる" test -f "$T/argv/hub-env.argv"
 t "司令塔のセッションが記録される" bash -c "ls '$T'/state/hub/envs/*/commander-session.json >/dev/null"
-t "finish できる" hub-work finish nb
+t "lead が finish できる" as_lead nb hub-lead finish
 t "worktree が消える" test ! -e "$E/.hub-worktrees/nb"
 t "archive へ移る" test -f "$W/archive/nb/status.md"
 cd /
@@ -861,11 +933,15 @@ t "環境を作れる" install_env
 t "README ができる" test -f "$I/hub-env/README.md"
 t "README の見出しに環境名が入る" grep -qxF '# hub-env — sample-env' "$I/hub-env/README.md"
 tn "README にプレースホルダーが残らない" grep -qF '{{' "$I/hub-env/README.md"
-t "README に頼み方の表がある" grep -qF '## 司令塔への頼み方' "$I/hub-env/README.md"
+t "README に頼み方の表がある" grep -qF '## 頼み方' "$I/hub-env/README.md"
+t "CLAUDE.md は地図を読み込む" grep -qx '@MAP.md' "$I/hub-env/CLAUDE.md"
+tn "CLAUDE.md にプレースホルダーが残らない" grep -qF '{{' "$I/hub-env/CLAUDE.md"
+t "delegate スキルは作らない" test ! -e "$I/hub-env/.claude/skills/delegate"
 t "sync-guide は配置しない" test ! -e "$I/hub-env/.claude/skills/sync-guide"
 echo "# install.sh: コマンドのリンク"
 B="$T/install-home/.local/bin"
 t "scripts のコマンドをリンクする" test -L "$B/hub-work"
+t "hub-lead と hub-crew もリンクする" bash -c "test -L '$B/hub-lead' && test -L '$B/hub-crew'"
 t "contrib/herdr の herdr-reset をリンクする" bash -c "[[ \"\$(readlink '$B/herdr-reset')\" == '$HUB/contrib/herdr/herdr-reset' ]]"
 t "backend.py はリンクしない" test ! -e "$B/backend.py"
 t "__pycache__ はリンクしない" test ! -e "$B/__pycache__"
