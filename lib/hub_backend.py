@@ -148,9 +148,6 @@ def backend_name(cfg: dict) -> str:
         return name
     if name := cfg.get("backend"):
         return name
-    # NOTE: backend を書かない旧形式の hub.toml は、session があれば herdr として読む。
-    if cfg.get("session"):
-        return "herdr"
     return "none"
 
 

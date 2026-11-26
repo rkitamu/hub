@@ -67,9 +67,9 @@ def find_env() -> tuple[Path, dict]:
 
 
 def _found(env: Path, cfg: dict) -> tuple[Path, dict]:
-    from hub_config import warn_legacy  # NOTE: hub_config が HubError を import するので、循環を避けて中で読む。
+    from hub_config import check_format  # NOTE: hub_config が HubError を import するので、循環を避けて中で読む。
 
-    warn_legacy(cfg)
+    check_format(cfg)
     return env, cfg
 
 

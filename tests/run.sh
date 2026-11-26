@@ -2,7 +2,7 @@
 # テストをサイズで呼び分ける。
 # 使い方: tests/run.sh [small|medium]
 #   small  : tests/test_hub_*.py（フック・backend・hub-work の単体テスト）
-#   medium : tests/integration.sh（一時ディレクトリと専用の herdr サーバーでの結合テスト。hub.toml の旧形式と新形式で 2 回）
+#   medium : tests/integration.sh（一時ディレクトリと専用の herdr サーバーでの結合テスト）
 #   引数なしなら両方を流す。1 件でも失敗すれば終了コードは 0 以外になる。
 set -uo pipefail
 
@@ -18,10 +18,8 @@ run_small() {
 }
 
 run_medium() {
-  echo "== medium: integration.sh（旧形式の hub.toml）"
-  "$TESTS/integration.sh" || failed+=("medium: integration.sh（旧形式）")
-  echo "== medium: integration.sh（新形式の hub.toml）"
-  HUB_TEST_TOML=new "$TESTS/integration.sh" || failed+=("medium: integration.sh（新形式）")
+  echo "== medium: integration.sh"
+  "$TESTS/integration.sh" || failed+=("medium: integration.sh")
 }
 
 case "${1:-all}" in

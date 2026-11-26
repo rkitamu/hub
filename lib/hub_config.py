@@ -1,22 +1,21 @@
 """hub.toml のうち、backend によらない部分（エージェントの定義）を読む。
 
-新形式は [[agent]] にエージェントを並べ、backend ごとの設定（herdr のレイアウトなど）は別の表に置く。
-移行期間は旧形式（[[workspace]] のペインに agent を書く形）も読み、司令塔の名前を hub として扱う。
+hub.toml は [[agent]] にエージェントを並べ、backend ごとの設定（herdr のレイアウトなど）は別の表に置く。
+旧形式（[[workspace]] のペインに agent を書く形）は読まず、contrib/herdr/migrate-hub-toml での書き換えを案内する。
 """
 
 from __future__ import annotations
 
 import re
-import sys
 from pathlib import Path
 
-from hublib import HubError
+from hublib import HUB_ROOT, HubError
 
 COMMANDER = "commander"
-LEGACY_COMMANDER = "hub"
+# 司令塔のセッションを記録するファイルの名前（環境の state ディレクトリの中）
+SESSION_RECORD = f"{COMMANDER}-session.json"
 AGENT_NAME_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9_-]*")
 LAUNCHERS = (None, "setup")
-_warned = False
 
 
 def is_legacy(cfg: dict) -> bool:
@@ -24,21 +23,10 @@ def is_legacy(cfg: dict) -> bool:
     return "agent" not in cfg and ("session" in cfg or "workspace" in cfg)
 
 
-def warn_legacy(cfg: dict) -> None:
-    global _warned
-    if is_legacy(cfg) and not _warned:
-        _warned = True
-        print("note: hub.toml が旧形式です。contrib/herdr/migrate-hub-toml で新形式に書き換えてください", file=sys.stderr)
-
-
-def commander_name(cfg: dict) -> str:
-    """司令塔のエージェントの名前。旧形式では hub、新形式では commander。"""
-    return LEGACY_COMMANDER if is_legacy(cfg) else COMMANDER
-
-
-def session_record_name(cfg: dict) -> str:
-    """司令塔のセッションを記録するファイルの名前（環境の state ディレクトリの中）。"""
-    return f"{commander_name(cfg)}-session.json"
+def check_format(cfg: dict) -> None:
+    if is_legacy(cfg):
+        raise HubError("hub.toml が旧形式です（[[agent]] がありません）。次のコマンドで新形式に書き換えてください:\n"
+                       f"  {HUB_ROOT / 'contrib/herdr/migrate-hub-toml'} <hub-env>/hub.toml --write")
 
 
 def _agent(env: Path, name: str, cwd: str, kind: str = "claude", args: list | None = None,
@@ -47,24 +35,9 @@ def _agent(env: Path, name: str, cwd: str, kind: str = "claude", args: list | No
             "launched_by": launched_by}
 
 
-def _legacy_agents(env: Path, cfg: dict) -> list[dict]:
-    out: list[dict] = []
-    for ws in cfg.get("workspace", []):
-        cwd = ws.get("cwd", "")
-        for name in ws.get("agents", []):
-            out.append(_agent(env, name, cwd, launched_by="setup"))
-        for tab in ws.get("tab", []):
-            for pane in tab.get("pane", []):
-                ag = pane.get("agent")
-                if isinstance(ag, dict) and ag.get("name"):
-                    out.append(_agent(env, ag["name"], pane.get("cwd") or cwd, ag.get("kind", "claude"), ag.get("args")))
-    return out
-
-
 def agent_defs(env: Path, cfg: dict) -> list[dict]:
     """エージェントの定義: [{"name", "cwd"（環境からの相対）, "path"（絶対）, "kind", "args", "launched_by"}]。"""
-    if is_legacy(cfg):
-        return _legacy_agents(env, cfg)
+    check_format(cfg)
     entries = cfg.get("agent", [])
     if not isinstance(entries, list):
         raise HubError("hub.toml の agent は [[agent]] の表で書いてください")

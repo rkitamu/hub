@@ -1,7 +1,6 @@
 #!/usr/bin/env bash
 # hub のコマンドを、一時ディレクトリの環境と専用の herdr サーバーで通しで試す。
 # 使い方: tests/integration.sh [todo-herdr のパス]
-# HUB_TEST_TOML=new で、環境の hub.toml を新形式（[[agent]] と [herdr]）に書き換えてから流す。既定は旧形式。
 # 実際のセッションに触らないよう、XDG_CONFIG_HOME ごと一時ディレクトリへ移し、ソケットがその中でなければ止まる。
 # setup の確認には同梱の代替スクリプトを使う。todo-herdr のパスを渡すと、そのコピーを使う（元のファイルには触らない）。
 # 互いに状態を共有しないグループごとに、一時ディレクトリと専用の herdr サーバーを作り、並列に実行する。
@@ -9,8 +8,8 @@ set -uo pipefail
 
 HUB="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 TODO_HERDR="${1:-}"
-# 司令塔の名前と、herdr のワークスペースの見出し。新形式では commander と [[herdr.workspace]]
-if [[ "${HUB_TEST_TOML:-old}" == new ]]; then CMDR=commander WSH='[[herdr.workspace]]'; else CMDR=hub WSH='[[workspace]]'; fi
+# 司令塔の名前と、herdr のワークスペースの見出し
+CMDR=commander WSH='[[herdr.workspace]]'
 unset HERDR_ENV HERDR_PANE_ID HERDR_TAB_ID HERDR_WORKSPACE_ID HERDR_SOCKET_PATH HERDR_SESSION
 export SHELL=/bin/bash
 export GIT_AUTHOR_NAME=t GIT_AUTHOR_EMAIL=t@example.invalid GIT_COMMITTER_NAME=t GIT_COMMITTER_EMAIL=t@example.invalid
@@ -153,18 +152,16 @@ cat >"$E/hub-env/MAP.md" <<'EOF'
 | `app` | 稼働 | アプリ | - |
 | `finance` | 未作成 | 家計簿 | - |
 
-## herdr 上のエージェント
+## エージェント
 
 | 名前 | herdr の場所 | 起動 | できること |
 |---|---|---|---|
-| `hub` | hub-env | herdr-reset | 司令塔 |
+| `commander` | hub-env | herdr-reset | 司令塔 |
 | `todo` | todo | herdr-reset todo | TODO |
 EOF
-if [[ "$CMDR" == commander ]]; then
-  "$HUB/contrib/herdr/migrate-hub-toml" "$E/hub-env/hub.toml" --write >/dev/null && rm "$E/hub-env/hub.toml.bak" ||
-    { echo "hub.toml を新形式にできませんでした"; exit 1; }
-  sed -i 's/^| `hub` | hub-env |/| `commander` | hub-env |/' "$E/hub-env/MAP.md"
-fi
+# NOTE: 旧形式で書いた hub.toml を migrate-hub-toml で新形式にして使う（書き換えも毎回確かめる）。
+"$HUB/contrib/herdr/migrate-hub-toml" "$E/hub-env/hub.toml" --write >/dev/null && rm "$E/hub-env/hub.toml.bak" ||
+  { echo "hub.toml を新形式にできませんでした"; exit 1; }
 echo "$E" >"$T/config/hub/envs"
 mkdir "$E/hub-env/rules"
 printf '環境ルール-固有文字列\n' >"$E/hub-env/rules/local.md"
@@ -694,12 +691,6 @@ t "--resume なしは新規に起動する" herdr-reset
 t "--resume なしでは再開の引数を渡さない" no_resume "$AH"
 t "--resume なしでは新しい ID が記録される" test "$(sid_now)" != "$sid"
 t "--help に --resume がある" bash -c 'herdr-reset --help | grep -q -- --resume'
-if [[ "$CMDR" == commander ]]; then
-  echo "# herdr-reset --resume（新形式に書き換える前の記録）"
-  sid="$(sid_now)"; mv "$SF" "$(dirname "$SF")/hub-session.json"
-  t "hub-session.json からも再開できる" herdr-reset --resume
-  t "旧い記録の ID で戻る" resumes "$AH" "$sid"
-fi
 }
 
 group_wtshape() {

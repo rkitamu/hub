@@ -80,22 +80,18 @@ class AgentDefsTest(unittest.TestCase):
     def defs(self, text):
         return hub_config.agent_defs(self.env, tomllib.loads(text))
 
-    def test_legacy(self):
+    def test_legacy_is_rejected(self):
         cfg = tomllib.loads(LEGACY)
         self.assertTrue(hub_config.is_legacy(cfg))
-        self.assertEqual(hub_config.commander_name(cfg), "hub")
-        self.assertEqual(hub_config.session_record_name(cfg), "hub-session.json")
-        got = {a["name"]: (a["cwd"], a["kind"], a["args"], a["launched_by"]) for a in self.defs(LEGACY)}
-        self.assertEqual(got, {"hub": ("hub-env", "claude", ["--model", "m"], None),
-                               "todo": ("todo", "claude", [], "setup"),
-                               "app-dev": ("app/sub", "codex", [], None)})
+        with self.assertRaises(hublib.HubError) as cm:
+            hub_config.agent_defs(self.env, cfg)
+        self.assertIn("migrate-hub-toml", str(cm.exception))
 
     def test_new(self):
         text = '[[agent]]\nname = "commander"\ncwd = "hub-env"\n[[agent]]\nname = "x"\ncwd = "x"\nargs = ["-a"]\n'
         cfg = tomllib.loads(text)
         self.assertFalse(hub_config.is_legacy(cfg))
-        self.assertEqual(hub_config.commander_name(cfg), "commander")
-        self.assertEqual(hub_config.session_record_name(cfg), "commander-session.json")
+        self.assertEqual(hub_config.SESSION_RECORD, "commander-session.json")
         defs = self.defs(text)
         self.assertEqual([a["name"] for a in defs], ["commander", "x"])
         self.assertEqual(defs[1]["path"], Path("/env/x"))
@@ -166,27 +162,27 @@ class TemplateTest(unittest.TestCase):
 class MigrateTest(unittest.TestCase):
     env = Path("/env")
 
-    def test_round_trip_keeps_agents_and_layout(self):
-        old = tomllib.loads(LEGACY)
-        new = tomllib.loads(migrate.migrate(old))
+    def test_converts_agents_and_layout(self):
+        new = tomllib.loads(migrate.migrate(tomllib.loads(LEGACY)))
         self.assertEqual(new["backend"], "herdr")
         self.assertEqual(new["herdr"]["session"], "personal")
         self.assertEqual(new["todo_file"], "todo/data/active.md")
-        rename = lambda n: "commander" if n == "hub" else n
-        strip = lambda defs: sorted((rename(a["name"]), a["path"], a["kind"], a["args"], a["launched_by"]) for a in defs)
-        self.assertEqual(strip(hub_config.agent_defs(self.env, new)), strip(hub_config.agent_defs(self.env, old)))
-        # レイアウトは、ペインの cwd がエージェントの cwd で埋まることと、司令塔の名前のほかは同じ
-        expected = herdr_backend.layout(self.env, old)
-        for ws in expected:
-            if "agents" in ws:
-                ws["agents"] = [rename(n) for n in ws["agents"]]
-            for tab in ws.get("tab", []):
-                for p in tab.get("pane", []):
-                    if "agent" in p:
-                        p["agent"] = {"name": rename(p["agent"]["name"]), "kind": p["agent"].get("kind", "claude"),
-                                      "args": p["agent"].get("args", [])}
-                        p.setdefault("cwd", ws["cwd"])
-        self.assertEqual(herdr_backend.layout(self.env, new), expected)
+        got = sorted((a["name"], a["cwd"], a["kind"], a["args"], a["launched_by"])
+                     for a in hub_config.agent_defs(self.env, new))
+        self.assertEqual(got, [("app-dev", "app/sub", "codex", [], None),
+                               ("commander", "hub-env", "claude", ["--model", "m"], None),
+                               ("todo", "todo", "claude", [], "setup")])
+        wss = herdr_backend.layout(self.env, new)
+        self.assertEqual([w["label"] for w in wss], ["hub-env", "todo", "app"])
+        self.assertEqual([t["label"] for t in wss[0]["tab"]], ["Claude", "Shell"])
+        self.assertEqual(wss[0]["tab"][0]["pane"][0],
+                         {"name": "claude", "cwd": "hub-env",
+                          "agent": {"name": "commander", "kind": "claude", "args": ["--model", "m"]}})
+        self.assertEqual((wss[1]["setup"], wss[1]["agents"]), ("todo/contrib/herdr/todo-herdr", ["todo"]))
+        view, claude = wss[2]["tab"][0]["pane"]
+        self.assertEqual(view, {"name": "view", "run": "make view"})
+        self.assertEqual(claude["split"], {"from": "view", "direction": "right", "ratio": 0.55})
+        self.assertEqual((claude["cwd"], claude["agent"]["name"]), ("app/sub", "app-dev"))
 
     def test_refuses(self):
         cases = {

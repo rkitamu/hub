@@ -30,8 +30,8 @@ class BackendNameTest(unittest.TestCase):
     def test_config_backend(self):
         self.assertEqual(hub_backend.backend_name({"backend": "none", "session": "s"}), "none")
 
-    def test_old_format_with_session_is_herdr(self):
-        self.assertEqual(hub_backend.backend_name({"session": "s"}), "herdr")
+    def test_old_session_alone_does_not_choose_herdr(self):
+        self.assertEqual(hub_backend.backend_name({"session": "s"}), "none")
 
     def test_default_is_none(self):
         self.assertEqual(hub_backend.backend_name({}), "none")
@@ -69,20 +69,21 @@ class HerdrDetectTest(unittest.TestCase):
         self.addCleanup(patcher.stop)
         self.herdr = hub_backend.load_module("herdr")
 
-    def test_old_and_new_session_keys(self):
+    def test_session_key(self):
         os.environ["HERDR_SESSION"] = "s"
-        self.assertTrue(self.herdr.detect(Path("/e"), {"session": "s"}))
         self.assertTrue(self.herdr.detect(Path("/e"), {"herdr": {"session": "s"}}))
-        self.assertFalse(self.herdr.detect(Path("/e"), {"session": "other"}))
+        self.assertFalse(self.herdr.detect(Path("/e"), {"herdr": {"session": "other"}}))
+        # 旧形式の session は読まない
+        self.assertFalse(self.herdr.detect(Path("/e"), {"session": "s"}))
 
     def test_outside_herdr(self):
         os.environ.pop("HERDR_SESSION", None)
-        self.assertFalse(self.herdr.detect(Path("/e"), {"session": "s"}))
+        self.assertFalse(self.herdr.detect(Path("/e"), {"herdr": {"session": "s"}}))
 
     def test_check_names_the_session(self):
         os.environ["HERDR_SESSION"] = "other"
         with self.assertRaises(hub_backend.BackendError) as cm:
-            self.herdr.create(Path("/e"), {"session": "s"}).check()
+            self.herdr.create(Path("/e"), {"herdr": {"session": "s"}}).check()
         self.assertIn("セッション s の", str(cm.exception))
 
     def test_launch_hint_quotes(self):
@@ -104,12 +105,16 @@ class FindEnvTest(unittest.TestCase):
         envs_patch = mock.patch.object(hublib, "ENVS_FILE", self.envs_file)
         envs_patch.start()
         self.addCleanup(envs_patch.stop)
-        self.a = self.make_env("a", 'session = "sa"\n')
-        self.b = self.make_env("b", 'session = "sb"\n')
+        self.a = self.make_env("a", self.toml("sa"))
+        self.b = self.make_env("b", self.toml("sb"))
         self.envs_file.write_text(f"{self.a}\n{self.b}\n")
         cwd = os.getcwd()
         self.addCleanup(os.chdir, cwd)
         os.chdir(self.root)
+
+    @staticmethod
+    def toml(session):
+        return f'backend = "herdr"\n[herdr]\nsession = "{session}"\n'
 
     def make_env(self, name, toml):
         env = self.root / name
@@ -130,10 +135,10 @@ class FindEnvTest(unittest.TestCase):
     def test_backend_session(self):
         os.environ["HERDR_SESSION"] = "sb"
         env, cfg = hublib.find_env()
-        self.assertEqual((env, cfg["session"]), (self.b, "sb"))
+        self.assertEqual((env, cfg["herdr"]["session"]), (self.b, "sb"))
 
     def test_two_envs_in_one_session(self):
-        (self.b / "hub-env/hub.toml").write_text('session = "sa"\n')
+        (self.b / "hub-env/hub.toml").write_text(self.toml("sa"))
         os.environ["HERDR_SESSION"] = "sa"
         with self.assertRaises(hublib.HubError):
             hublib.find_env()
@@ -148,6 +153,13 @@ class FindEnvTest(unittest.TestCase):
         os.environ["HERDR_SESSION"] = "nope"
         os.chdir(self.b / "hub-env")
         self.assertEqual(hublib.find_env()[0], self.b)
+
+    def test_legacy_format_is_rejected(self):
+        (self.b / "hub-env/hub.toml").write_text('session = "sb"\n')
+        os.environ["HUB_ENV"] = str(self.b)
+        with self.assertRaises(hublib.HubError) as cm:
+            hublib.find_env()
+        self.assertIn("migrate-hub-toml", str(cm.exception))
 
     def test_nowhere(self):
         with self.assertRaises(hublib.HubError):
