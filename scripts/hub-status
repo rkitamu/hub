@@ -17,8 +17,8 @@ from datetime import date, datetime, timedelta
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "lib"))
-from hublib import (HubError, dirty_files, find_env, is_git_repo, live_agents, read_status,  # noqa: E402
-                    todo_file, work_dir)
+from hub_backend import backend_for  # noqa: E402
+from hublib import HubError, dirty_files, find_env, is_git_repo, read_status, todo_file, work_dir  # noqa: E402
 
 
 def repo_dirs(env: Path, cfg: dict) -> list[Path]:
@@ -50,10 +50,12 @@ def main() -> int:
     a = p.parse_args()
     try:
         env, cfg = find_env()
+        backend = backend_for(env, cfg)
+        backend.check()
         print("## エージェント")
-        agents = [x for x in live_agents() if x.get("name")]
+        agents = [x for x in backend.list_agents() if x.get("name")]
         for x in sorted(agents, key=lambda x: x["name"]):
-            print(f"{x['name']}\t{x.get('agent_status')}\t{x.get('cwd')}")
+            print(f"{x['name']}\t{x.get('status')}\t{x.get('cwd')}")
         if not agents:
             print("（なし）")
 

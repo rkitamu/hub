@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # テストをサイズで呼び分ける。
 # 使い方: tests/run.sh [small|medium]
-#   small  : tests/test_hub_*.py（フックの単体テスト）
+#   small  : tests/test_hub_*.py（フック・backend・hub-work の単体テスト）
 #   medium : tests/integration.sh（一時ディレクトリと専用の herdr サーバーでの結合テスト）
 #   引数なしなら両方を流す。1 件でも失敗すれば終了コードは 0 以外になる。
 set -uo pipefail

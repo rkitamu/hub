@@ -18,7 +18,8 @@ import sys
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "lib"))
-from hublib import HubError, find_env, is_git_repo, live_agents, read_status, work_dir, workspaces  # noqa: E402
+from hub_backend import Backend, backend_for  # noqa: E402
+from hublib import HubError, find_env, is_git_repo, read_status, work_dir  # noqa: E402
 
 PLANNED = ("未作成", "構想")
 
@@ -64,7 +65,7 @@ def work_records(wd: Path) -> tuple[set[str], set[str]]:
     return agents, labels
 
 
-def check(env: Path, cfg: dict) -> list[str]:
+def check(env: Path, cfg: dict, backend: Backend) -> list[str]:
     out: list[str] = []
     map_path = env / "hub-env/MAP.md"
     if not map_path.is_file():
@@ -104,7 +105,7 @@ def check(env: Path, cfg: dict) -> list[str]:
         out.append(f"エージェント {name}: hub.toml にありますが MAP.md にありません")
 
     work_agents, work_labels = work_records(work_dir(env))
-    live = {a.get("name") for a in live_agents() if a.get("name")}
+    live = {a.get("name") for a in backend.list_agents() if a.get("name")}
     for name in sorted(in_toml - live):
         out.append(f"エージェント {name}: hub.toml にありますが動いていません")
     for name in sorted(live - in_toml - in_map - work_agents):
@@ -114,7 +115,7 @@ def check(env: Path, cfg: dict) -> list[str]:
 
     # ワークスペース
     known = {ws.get("label") for ws in cfg.get("workspace", [])} | work_labels
-    for w in workspaces():
+    for w in backend.list_places():
         if w["label"] not in known:
             out.append(f"ワークスペース {w['label']}: hub.toml にも作業にもありません")
     return out
@@ -126,7 +127,9 @@ def main() -> int:
         return 0
     try:
         env, cfg = find_env()
-        problems = check(env, cfg)
+        backend = backend_for(env, cfg)
+        backend.check()
+        problems = check(env, cfg, backend)
     except HubError as e:
         print(f"error: {e}", file=sys.stderr)
         return 2

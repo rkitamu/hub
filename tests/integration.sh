@@ -688,6 +688,52 @@ t "--resume なしでは新しい ID が記録される" test "$(sid_now)" != "$
 t "--help に --resume がある" bash -c 'hub-reset --help | grep -q -- --resume'
 }
 
+group_wtshape() {
+make_env
+prep hub-reset
+echo "# hub-work: herdr の worktree のまとまり方"
+mkdir "$E/solo" && git -C "$E/solo" init -q -b main && git -C "$E/solo" commit -q --allow-empty -m init
+# ワークスペースの並び・worktree の種類（main / linked）・元のリポジトリ・checkout・タブを、一時ディレクトリを伏せて出す
+shape() {
+  herdr workspace list | jq -r '.result.workspaces[] | [.workspace_id, .label, (if .worktree then (if .worktree.is_linked_worktree then "linked" else "main" end) + " " + .worktree.repo_name + " " + .worktree.checkout_path else "-" end), .pane_count] | @tsv' |
+    while IFS=$'\t' read -r id label wt panes; do
+      printf '%s\t%s\t%s\t%s\n' "$label" "${wt//$T/T}" "$(herdr tab list --workspace "$id" | jq -r '[.result.tabs[].label] | join(",")')" "$panes"
+    done
+}
+same_shape() { diff <(shape) - >"$T/shape.diff" || { cat "$T/shape.diff"; return 1; }; }
+t "親のあるリポジトリで worktree の作業を始める" hub-work start wa --repo app --worktree
+t "親の無いリポジトリを含む worktree の作業を始める" hub-work start wb --repo solo --repo app --worktree
+t "自動で作られた親が記録される" grep -q '"source"' "$W/wb/status.md"
+t "start 後のまとまり方" same_shape <<EOF
+hub-env	-	Claude	1
+todo	-	1	3
+app	main app T/env/app	app	1
+w-wa	linked app T/env/.hub-worktrees/wa/app	app	1
+solo	main solo T/env/solo	1	1
+w-wb	linked solo T/env/.hub-worktrees/wb/solo	solo	1
+w-wb--app	linked app T/env/.hub-worktrees/wb/app	app	1
+EOF
+prep hub-reset
+t "既存の checkout から立て直す" hub-work resume wb
+t "resume 後のまとまり方" same_shape <<EOF
+hub-env	-	Claude	1
+todo	-	1	3
+app	main app T/env/app	app	1
+solo	main solo T/env/solo	1	1
+w-wb	linked solo T/env/.hub-worktrees/wb/solo	solo	1
+w-wb--app	linked app T/env/.hub-worktrees/wb/app	app	1
+EOF
+t "wb を finish できる" hub-work finish wb
+t "wa を finish できる" hub-work finish wa
+t "finish 後のまとまり方" same_shape <<EOF
+hub-env	-	Claude	1
+todo	-	1	3
+app	main app T/env/app	app	1
+EOF
+t "checkout が消える" test ! -e "$E/.hub-worktrees/wb"
+t "worktree の登録が残らない" bash -c "! git -C '$E/app' worktree list | grep -q hub-worktrees && ! git -C '$E/solo' worktree list | grep -q hub-worktrees"
+}
+
 group_install() {
 make_tmp
 echo "# install.sh --env: README"
@@ -706,7 +752,9 @@ t "既存の README を上書きしない" grep -qxF '手元の README' "$I/hub-
 }
 
 # ── 実行 ───────────────────────────────────────────────────
-SUITES=(base ttree parent blocked trust outer legacy first_setup handoff_fail handoff_blocked handoff_bg resume install)
+SUITES=(base ttree parent wtshape blocked trust outer legacy first_setup handoff_fail handoff_blocked handoff_bg resume install)
+# HUB_TEST_GROUPS="base wtshape" のように、一部のグループだけを流せる
+[[ -n "${HUB_TEST_GROUPS:-}" ]] && read -ra SUITES <<<"$HUB_TEST_GROUPS"
 LOGS="$(mktemp -d /tmp/hubl.XXXXXX)"
 trap 'rm -rf "$LOGS"' EXIT
 for g in "${SUITES[@]}"; do

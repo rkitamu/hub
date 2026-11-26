@@ -1,0 +1,134 @@
+"""エージェントを置いて動かす仕組み（backend）の呼び出し口。
+
+core（scripts/ と lib/）は、ここに定義した操作だけで backend を使う。backend の実装は
+<hub>/contrib/<名前>/backend.py に置き、モジュールの create(env, cfg) が Backend を返す。
+
+用語:
+- 場所（place）: backend がエージェントを置く単位。herdr ではワークスペース。status.md の workspace はそのラベル。
+- 置き場（pane）: 場所の中で、エージェントを 1 人起動できるところ。
+- AgentSpec: {"name", "kind", "cwd", "argv"}。argv は hub の引数を足し終えた claude の引数で、backend は加工しない。
+"""
+
+from __future__ import annotations
+
+import importlib.util
+import os
+import re
+import shlex
+from pathlib import Path
+from types import ModuleType
+
+from hublib import HubError
+
+HUB_ROOT = Path(__file__).resolve().parent.parent
+NAME_RE = re.compile(r"[a-z][a-z0-9_-]*")
+
+
+class BackendError(HubError):
+    def __init__(self, message: str, code: str | None = None):
+        super().__init__(message)
+        self.code = code
+
+
+class Backend:
+    """backend の操作の一覧。実装はこれを継承し、使う操作を上書きする。"""
+
+    name = "?"
+
+    def __init__(self, env: Path, cfg: dict):
+        self.env = env
+        self.cfg = cfg
+
+    def check(self) -> None:
+        """使えなければ BackendError。何かを作る前に呼ぶ。"""
+
+    def list_agents(self) -> list[dict]:
+        """動いているエージェント: [{"name", "status", "cwd", "place"}]。"""
+        raise NotImplementedError
+
+    def list_places(self) -> list[dict]:
+        """場所: [{"id", "label"}]。"""
+        raise NotImplementedError
+
+    def current_place(self) -> str | None:
+        """このプロセスがいる場所のラベル。場所の外なら None。"""
+        return None
+
+    def open_place(self, label: str, cwd: Path, title: str, worktree: dict | None = None) -> dict:
+        """場所を作り、{"place": <id>, "pane": <最初の置き場>, "data": {...}} を返す。
+
+        worktree は {"repo", "path", "branch"}。checkout は core が作成済み。
+        data は backend 用の値で、core は worktree の記録に足して保存し、close_place に返す。
+        """
+        raise NotImplementedError
+
+    def add_slot(self, place: str, cwd: Path, title: str) -> str:
+        """既存の場所に置き場を足し、その id を返す。"""
+        raise NotImplementedError
+
+    def start_agent(self, pane: str, spec: dict) -> str:
+        """起動して "started" を返す。確認ダイアログで止まっていれば "needs_confirm"。失敗は BackendError。"""
+        raise NotImplementedError
+
+    def send(self, name: str, text: str) -> str:
+        """送って "ok" / "blocked" / "timeout" / その他のエラーコードを返す。text はエラーやログに出さない。"""
+        raise NotImplementedError
+
+    def read(self, name: str, lines: int = 40) -> str:
+        """エージェントの画面の文字列。読めなければ空文字。"""
+        return ""
+
+    def can_close(self, labels: set[str], worktree_labels: set[str]) -> list[str]:
+        """閉じると困る理由の一覧。空なら閉じてよい。"""
+        return []
+
+    def close_place(self, label: str, worktree: dict | None = None) -> bool:
+        """場所を閉じ、閉じたら True。worktree は記録（data を含む）。checkout が残れば core が消す。"""
+        raise NotImplementedError
+
+    def launch_hint(self, spec: dict) -> str:
+        """人が手で起動するためのコマンド。"""
+        cmd = [spec.get("kind", "claude"), *spec.get("argv", [])]
+        return f"cd {shlex.quote(str(spec['cwd']))} && {shlex.join(cmd)}"
+
+
+def load_module(name: str) -> ModuleType:
+    if not NAME_RE.fullmatch(name):
+        raise HubError(f"backend の名前が不正です: {name}")
+    path = HUB_ROOT / "contrib" / name / "backend.py"
+    if not path.is_file():
+        raise HubError(f"backend {name} がありません: {path}")
+    key = f"hub_backend_{name.replace('-', '_')}"
+    spec = importlib.util.spec_from_file_location(key, path)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+def backend_name(cfg: dict) -> str:
+    if name := os.environ.get("HUB_BACKEND"):
+        return name
+    if name := cfg.get("backend"):
+        return name
+    # NOTE: backend を書かない旧形式の hub.toml は、session があれば herdr として読む。
+    if cfg.get("session"):
+        return "herdr"
+    return "none"
+
+
+def detect(env: Path, cfg: dict) -> bool:
+    """このプロセスが、その環境の backend の中で動いているか。"""
+    name = backend_name(cfg)
+    if name == "none":
+        return False
+    try:
+        return bool(load_module(name).detect(env, cfg))
+    except HubError:
+        return False
+
+
+def backend_for(env: Path, cfg: dict) -> Backend:
+    name = backend_name(cfg)
+    if name == "none":
+        raise HubError("hub.toml に backend がありません（backend か session を書いてください）")
+    return load_module(name).create(env, cfg)

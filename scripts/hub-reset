@@ -36,8 +36,13 @@ import uuid
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "lib"))
-from hublib import HerdrError, agent_argv, claude_launch_args, env_state_dir, find_env, herdr, workspaces  # noqa: E402
+from hub_backend import load_module  # noqa: E402
 from hublib import HubError as ResetError  # noqa: E402
+from hublib import agent_argv, claude_launch_args, env_state_dir, find_env  # noqa: E402
+
+# NOTE: hub-reset は herdr のレイアウトそのものを組み立てるので、backend の操作ではなく herdr を直接呼ぶ。
+_herdr = load_module("herdr")
+HerdrError, herdr, workspaces = _herdr.HerdrError, _herdr.herdr, _herdr.workspaces
 
 LOG = Path(os.environ.get("XDG_STATE_HOME") or Path.home() / ".local/state") / "hub-reset.log"
 PLACEHOLDER = "hub-reset-tmp"
@@ -621,6 +626,7 @@ def main() -> int:
         if bad:
             raise ResetError(f"知らないオプションです: {bad[0]}")
         ENV_DIR, cfg = find_env()
+        _herdr.create(ENV_DIR, cfg).check()  # 環境が cwd や HUB_ENV から決まっても、別のセッションは操作しない
         handoff_path = env_state_dir(ENV_DIR) / "handoff.md"
         if resumed:
             if not handoff_path.is_file():
