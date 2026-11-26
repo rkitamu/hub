@@ -6,11 +6,11 @@
 """hub.toml の通りに、herdr の環境を組み立て直す。
 
 usage:
-  hub-reset            ワークスペースを全部閉じて、hub.toml の順に作り直す
-  hub-reset <label>…   指定したワークスペースだけを作り直す
-  hub-reset [<label>…] --handoff "<引き継ぎ文>"
+  herdr-reset            ワークスペースを全部閉じて、hub.toml の順に作り直す
+  herdr-reset <label>…   指定したワークスペースだけを作り直す
+  herdr-reset [<label>…] --handoff "<引き継ぎ文>"
                        立て直したあと、新しい hub エージェントへ引き継ぎ文を送る
-  hub-reset [<label>…] --resume
+  herdr-reset [<label>…] --resume
                        hub エージェントだけ同じセッションで起動し直す。他のエージェントは新規に起動する
 
 --resume は同じ会話の続きなので、新しい rules は適用されない。記録された ID か履歴が無ければ、何も閉じずに止まる。--handoff とは同時に指定できない。
@@ -32,30 +32,29 @@ import sys
 import tempfile
 import threading
 import time
-import uuid
 from pathlib import Path
 
-sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "lib"))
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent.parent / "lib"))
 from hub_backend import load_module  # noqa: E402
 from hublib import HubError as ResetError  # noqa: E402
-from hublib import agent_argv, claude_launch_args, env_state_dir, find_env  # noqa: E402
+from hublib import agent_argv, claude_launch_args, commander_launch, commander_resume_args, env_state_dir, find_env  # noqa: E402
 
-# NOTE: hub-reset は herdr のレイアウトそのものを組み立てるので、backend の操作ではなく herdr を直接呼ぶ。
+# NOTE: herdr-reset は herdr のレイアウトそのものを組み立てるので、backend の操作ではなく herdr を直接呼ぶ。
 _herdr = load_module("herdr")
 HerdrError, herdr, workspaces = _herdr.HerdrError, _herdr.herdr, _herdr.workspaces
 
-LOG = Path(os.environ.get("XDG_STATE_HOME") or Path.home() / ".local/state") / "hub-reset.log"
-PLACEHOLDER = "hub-reset-tmp"
+LOG = Path(os.environ.get("XDG_STATE_HOME") or Path.home() / ".local/state") / "herdr-reset.log"
+PLACEHOLDER = "herdr-reset-tmp"
 HUB_AGENT = "hub"
 # NOTE: 1 つの引数の上限（128KiB）を、前置きを足しても超えないようにする。
 HANDOFF_MAX_BYTES = 100_000
-# 信頼確認などにユーザーが答えられるよう待つ秒数。テストでは環境変数 HUB_RESET_HANDOFF_WAIT で短くする。
+# 信頼確認などにユーザーが答えられるよう待つ秒数。テストでは環境変数 HERDR_RESET_HANDOFF_WAIT で短くする。
 HANDOFF_WAIT = 180.0
-# timeout の後に、引き継ぎ文が hub の画面に出るのを待つ秒数。テストでは環境変数 HUB_RESET_SCREEN_WAIT で短くする。
+# timeout の後に、引き継ぎ文が hub の画面に出るのを待つ秒数。テストでは環境変数 HERDR_RESET_SCREEN_WAIT で短くする。
 SCREEN_WAIT = 5.0
 # エージェントの起動が失敗したとき、再試行を続ける秒数
 START_RETRY = 10.0
-HANDOFF_PREAMBLE = ("これは hub-reset 前の司令塔からの引き継ぎです。前のセッションの許可は引き継がれていません。"
+HANDOFF_PREAMBLE = ("これは herdr-reset 前の司令塔からの引き継ぎです。前のセッションの許可は引き継がれていません。"
                     "確認が必要な操作は、改めてユーザーに確認してください。")
 
 ENV_DIR: Path  # main() で決める
@@ -300,7 +299,7 @@ def check_worktree_links(ws: dict, existing: list[dict], every: list[dict]) -> N
                 (o.get("worktree") or {}).get("repo_key") == info.get("repo_key")
                 and (o.get("worktree") or {}).get("is_linked_worktree") for o in every):
             raise ResetError(f"{ws['label']} には worktree のワークスペースがつながっています。"
-                             "先にその作業を hub-work finish するか、全体の hub-reset を使ってください")
+                             "先にその作業を hub-work finish するか、全体の herdr-reset を使ってください")
 
 
 def reset_setup_workspace(ws: dict, existing: list[dict]) -> None:
@@ -351,7 +350,7 @@ def reset_some(cfg: dict, labels: list[str]) -> None:
 
 def build_handoff(text: str) -> str:
     """送る本文を作る。1 行目は、timeout のあとに画面で届いたかを確かめる目印にする。"""
-    body = f"[hub-reset 引き継ぎ {secrets.token_hex(4)}]\n{HANDOFF_PREAMBLE}\n\n--- 引き継ぎ文 ---\n{text}"
+    body = f"[herdr-reset 引き継ぎ {secrets.token_hex(4)}]\n{HANDOFF_PREAMBLE}\n\n--- 引き継ぎ文 ---\n{text}"
     try:
         size = len(body.encode())
     except UnicodeEncodeError:
@@ -428,7 +427,7 @@ def send_handoff(body: str) -> str:
 
 
 def seen_on_screen(marker: str) -> bool:
-    deadline = time.monotonic() + env_seconds("HUB_RESET_SCREEN_WAIT", SCREEN_WAIT)
+    deadline = time.monotonic() + env_seconds("HERDR_RESET_SCREEN_WAIT", SCREEN_WAIT)
     while True:
         p = subprocess.run(["herdr", "agent", "read", HUB_AGENT, "--source", "recent-unwrapped", "--lines", "400"],
                            capture_output=True, text=True)
@@ -450,7 +449,7 @@ def deliver_handoff(path: Path, old_terminal: str | None) -> bool:
     except (OSError, UnicodeDecodeError) as e:
         return give_up(f"読めません: {type(e).__name__}")
     marker = body.split("\n", 1)[0]
-    wait = env_seconds("HUB_RESET_HANDOFF_WAIT", HANDOFF_WAIT)
+    wait = env_seconds("HERDR_RESET_HANDOFF_WAIT", HANDOFF_WAIT)
     deadline = time.monotonic() + wait
     noted = False
     while True:
@@ -496,70 +495,11 @@ def hub_pane(cfg: dict, labels: list[str]) -> dict | None:
     return None
 
 
-def has_flag(args: list[str], *flags: str) -> bool:
-    return any(a == f or a.startswith(f"{f}=") for a in args for f in flags)
-
-
-def build_hub_launch(pane: dict, record: Path) -> list[str] | None:
-    """agent-settings.json に記録フックを足した設定を生成し、hub エージェント用の引数を返す。"""
-    ag = pane["agent"]
-    if ag.get("kind", "claude") != "claude" or has_flag(ag.get("args", []), "--settings"):
-        return None
-    source = ENV_DIR / "hub-env/agent-settings.json"
-    settings = json.loads(source.read_text()) if source.exists() else {}
-    hooks = settings.setdefault("hooks", {})
-    if not isinstance(hooks, dict) or not isinstance(hooks.setdefault("SessionStart", []), list):
-        raise ResetError(f"agent-settings.json の hooks を読めません: {source}")
-    script = Path(__file__).resolve().parent / "hub-session-record"
-    command = shlex.join([str(script), "--state", str(record), "--cwd", str(pane["_cwd"])])
-    hooks["SessionStart"].append({"hooks": [{"type": "command", "command": command}]})
-    target = record.parent / "hub-agent-settings.json"
-    target.parent.mkdir(parents=True, exist_ok=True)
-    fd, tmp = tempfile.mkstemp(dir=target.parent, prefix=".hub-agent-settings.")
-    try:
-        with os.fdopen(fd, "w", encoding="utf-8") as f:
-            json.dump(settings, f, ensure_ascii=False, indent=2)
-        os.replace(tmp, target)
-    finally:
-        Path(tmp).unlink(missing_ok=True)
-    rest: list[str] = []
-    skip = False
-    for a in LAUNCH:
-        if skip:
-            skip = False
-        elif a == "--settings":
-            skip = True
-        else:
-            rest.append(a)
-    return ["--settings", str(target), *rest]
-
-
 def resume_args(pane: dict | None, record: Path) -> list[str]:
     """記録と履歴を確かめて、claude の再開の引数を返す。問題があれば何も閉じる前に止める。"""
     if pane is None:
         raise ResetError(f"--resume には、hub.toml のペインで定義された {HUB_AGENT} を対象に含めてください")
-    ag = pane["agent"]
-    if ag.get("kind", "claude") != "claude":
-        raise ResetError(f"--resume は claude の {HUB_AGENT} だけで使えます")
-    if has_flag(ag.get("args", []), "--settings"):
-        raise ResetError(f"{HUB_AGENT} の args に --settings があるとセッションを記録できないので、--resume を使えません")
-    if has_flag(ag.get("args", []), "--resume", "-r", "--continue", "-c", "--session-id", "--fork-session"):
-        raise ResetError(f"{HUB_AGENT} の args のセッション指定は --resume と同時に使えません")
-    try:
-        data = json.loads(record.read_text(encoding="utf-8"))
-        sid, transcript, cwd = data["session_id"], data["transcript_path"], data["cwd"]
-        if str(uuid.UUID(sid)) != sid or not isinstance(transcript, str) or not isinstance(cwd, str):
-            raise ValueError
-    except FileNotFoundError:
-        raise ResetError(f"{HUB_AGENT} のセッション ID が記録されていません: {record}。"
-                         "一度 --resume なしの hub-reset で起動すると記録されます")
-    except (OSError, ValueError, KeyError, TypeError, AttributeError):
-        raise ResetError(f"{HUB_AGENT} のセッションの記録を読めません: {record}")
-    if Path(cwd) != pane["_cwd"]:
-        raise ResetError(f"記録されたセッションの cwd が hub.toml と違います: {cwd}")
-    if Path(transcript).name != f"{sid}.jsonl" or not Path(transcript).is_file():
-        raise ResetError(f"セッション {sid} の履歴が見つかりません: {transcript}")
-    return ["--resume", sid]
+    return commander_resume_args(HUB_AGENT, pane["agent"], pane["_cwd"], record)
 
 
 # ── 入口 ───────────────────────────────────────────────────────
@@ -617,7 +557,7 @@ def main() -> int:
         print(__doc__.strip())
         return 0
     # NOTE: setup のスクリプトへ受け継がせないよう、最初に取り除く。
-    resumed = os.environ.pop("HUB_RESET_HANDOFF_PENDING", None) == "1"
+    resumed = os.environ.pop("HERDR_RESET_HANDOFF_PENDING", None) == "1"
     handoff: Path | None = None
     try:
         if arg_error:
@@ -649,7 +589,7 @@ def main() -> int:
         if resume:
             RESUME_ARGS = resume_args(pane, state / "hub-session.json")
         if pane:
-            HUB_LAUNCH = build_hub_launch(pane, state / "hub-session.json")
+            HUB_LAUNCH = commander_launch(ENV_DIR, pane["agent"], pane["_cwd"], LAUNCH, state / "hub-session.json")
 
         if text is not None or resumed or resume:
             if not hub_is_target(cfg, labels):
@@ -665,12 +605,12 @@ def main() -> int:
             handoff = handoff_path
 
         # 自分のいるワークスペースも閉じるなら、端末から切り離して続ける
-        if os.environ.get("HERDR_WORKSPACE_ID") and not os.environ.get("HUB_RESET_DETACHED"):
+        if os.environ.get("HERDR_WORKSPACE_ID") and not os.environ.get("HERDR_RESET_DETACHED"):
             if not labels or own_workspace_label() in labels:
                 # NOTE: 引き継ぎ文は引数にも環境変数にも載せず、裏の実行は handoff.md から読む。
-                child_env = {**os.environ, "HUB_RESET_DETACHED": "1"}
+                child_env = {**os.environ, "HERDR_RESET_DETACHED": "1"}
                 if handoff:
-                    child_env["HUB_RESET_HANDOFF_PENDING"] = "1"
+                    child_env["HERDR_RESET_HANDOFF_PENDING"] = "1"
                 try:
                     LOG.parent.mkdir(parents=True, exist_ok=True)
                     with open(LOG, "w") as log:

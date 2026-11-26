@@ -6,10 +6,12 @@ import hashlib
 import json
 import os
 import re
+import shlex
 import subprocess
 import tempfile
 import time
 import tomllib
+import uuid
 from collections.abc import Iterator
 from contextlib import contextmanager
 from pathlib import Path
@@ -129,6 +131,77 @@ def agent_argv(kind: str, launch: list[str], own: list[str], extra: list[str] | 
         if any(a == flag or a.startswith(f"{flag}=") for a in own):
             raise HubError(f"agent の args の {flag} は hub が渡す引数と衝突します。rules か agent-settings.json に移してください")
     return [*own, *launch, *(extra or [])]
+
+
+# ── 司令塔のセッションの記録と再開 ─────────────────────────────────
+
+HUB_ROOT = Path(__file__).resolve().parent.parent
+SESSION_FLAGS = ("--resume", "-r", "--continue", "-c", "--session-id", "--fork-session")
+
+
+def has_flag(args: list[str], *flags: str) -> bool:
+    return any(a == f or a.startswith(f"{f}=") for a in args for f in flags)
+
+
+def commander_launch(env: Path, agent: dict, cwd: Path, launch: list[str], record: Path) -> list[str] | None:
+    """agent-settings.json にセッション記録のフックを足した設定を生成し、司令塔に launch の代わりに渡す引数を返す。
+
+    claude でないか、agent の args に --settings があれば記録できないので None。
+    """
+    if agent.get("kind", "claude") != "claude" or has_flag(agent.get("args", []), "--settings"):
+        return None
+    source = env / "hub-env/agent-settings.json"
+    settings = json.loads(source.read_text()) if source.exists() else {}
+    hooks = settings.setdefault("hooks", {})
+    if not isinstance(hooks, dict) or not isinstance(hooks.setdefault("SessionStart", []), list):
+        raise HubError(f"agent-settings.json の hooks を読めません: {source}")
+    script = HUB_ROOT / "scripts/hub-session-record"
+    command = shlex.join([str(script), "--state", str(record), "--cwd", str(cwd)])
+    hooks["SessionStart"].append({"hooks": [{"type": "command", "command": command}]})
+    target = record.parent / "hub-agent-settings.json"
+    target.parent.mkdir(parents=True, exist_ok=True)
+    fd, tmp = tempfile.mkstemp(dir=target.parent, prefix=".hub-agent-settings.")
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            json.dump(settings, f, ensure_ascii=False, indent=2)
+        os.replace(tmp, target)
+    finally:
+        Path(tmp).unlink(missing_ok=True)
+    rest: list[str] = []
+    skip = False
+    for a in launch:
+        if skip:
+            skip = False
+        elif a == "--settings":
+            skip = True
+        else:
+            rest.append(a)
+    return ["--settings", str(target), *rest]
+
+
+def commander_resume_args(name: str, agent: dict, cwd: Path, record: Path) -> list[str]:
+    """記録と履歴を確かめて、司令塔を同じセッションで起動し直す claude の引数を返す。問題があれば HubError。"""
+    if agent.get("kind", "claude") != "claude":
+        raise HubError(f"--resume は claude の {name} だけで使えます")
+    if has_flag(agent.get("args", []), "--settings"):
+        raise HubError(f"{name} の args に --settings があるとセッションを記録できないので、--resume を使えません")
+    if has_flag(agent.get("args", []), *SESSION_FLAGS):
+        raise HubError(f"{name} の args のセッション指定は --resume と同時に使えません")
+    try:
+        data = json.loads(record.read_text(encoding="utf-8"))
+        sid, transcript, recorded_cwd = data["session_id"], data["transcript_path"], data["cwd"]
+        if str(uuid.UUID(sid)) != sid or not isinstance(transcript, str) or not isinstance(recorded_cwd, str):
+            raise ValueError
+    except FileNotFoundError:
+        raise HubError(f"{name} のセッション ID が記録されていません: {record}。"
+                       "一度 --resume なしで起動すると記録されます")
+    except (OSError, ValueError, KeyError, TypeError, AttributeError):
+        raise HubError(f"{name} のセッションの記録を読めません: {record}")
+    if Path(recorded_cwd) != cwd:
+        raise HubError(f"記録されたセッションの cwd が hub.toml と違います: {recorded_cwd}")
+    if Path(transcript).name != f"{sid}.jsonl" or not Path(transcript).is_file():
+        raise HubError(f"セッション {sid} の履歴が見つかりません: {transcript}")
+    return ["--resume", sid]
 
 
 # ── Claude Code のフォルダ信頼 ───────────────────────────────────

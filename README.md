@@ -32,7 +32,7 @@ git -C ~/src/hub config core.hooksPath .githooks   # hub の main / master へ�
 
 次のコマンドが `~/.local/bin` にリンクされる。
 
-- `hub-reset`
+- `herdr-reset`
 - `hub-work`
 - `hub-status`
 - `hub-check`
@@ -52,15 +52,15 @@ git clone <todo> todo   # 子リポジトリの例
 
 ### 3. `hub-env/hub.toml` と `hub-env/MAP.md` を編集する
 
-雛形には、司令塔の `hub-env` ワークスペースだけが有効な最小構成で入っている。そのままでも `hub-reset` で動く。
+雛形には、司令塔の `hub-env` ワークスペースだけが有効な最小構成で入っている。そのままでも `herdr-reset` で動く。
 
 `todo` ワークスペース・`todo` エージェント・`scripts/todo-view` などは、作者の手元の todo リポジトリを前提にした例で、コメントアウトしてある。自分の子リポジトリに合わせて書き換えるか、消す。
 
-### 4. herdr を開いて `hub-reset` を実行する
+### 4. herdr を開いて `herdr-reset` を実行する
 
 ```sh
 herdr --session <セッション名>
-hub-reset
+herdr-reset
 ```
 
 セッション名は `hub.toml` の `session` に書いたもの。
@@ -87,14 +87,14 @@ hub-reset
 ## コマンド
 
 ```sh
-hub-reset         # ワークスペースを全部閉じて、hub.toml の通りに作り直す
-hub-reset todo    # todo ワークスペース（hub.toml の label）だけを作り直す
-hub-reset [<label>...] --handoff "<引き継ぎ文>"   # 立て直したあと、新しい hub エージェントへ引き継ぐ
-hub-reset [<label>...] --resume   # セッションを復帰して立て直す
+herdr-reset         # ワークスペースを全部閉じて、hub.toml の通りに作り直す
+herdr-reset todo    # todo ワークスペース（hub.toml の label）だけを作り直す
+herdr-reset [<label>...] --handoff "<引き継ぎ文>"   # 立て直したあと、新しい hub エージェントへ引き継ぐ
+herdr-reset [<label>...] --resume   # セッションを復帰して立て直す
 
 hub-work start <作業名> --repo <repo> [--todo <id>] [--worktree] [--purpose <目的>] [--request <依頼文>]
 hub-work finish <作業名>   # 記録されたものだけを閉じ、archive へ移す
-hub-work resume <作業名>   # hub-reset の後などに、status.md から立て直す
+hub-work resume <作業名>   # herdr-reset の後などに、status.md から立て直す
 hub-work list [--all]
 
 hub-status [--days 7]      # エージェント・未コミット・進行中の作業・期限の近い TODO
@@ -103,12 +103,12 @@ hub-check                  # MAP.md・hub.toml・リポジトリ・エージェ�
 
 `hub.toml` の `session` に書いたセッションのペインで実行する。
 
-### 引き継ぎ（hub-reset --handoff）
+### 引き継ぎ（herdr-reset --handoff）
 
-`hub-reset --handoff "<引き継ぎ文>"` で、立て直したあとの司令塔へ作業を引き継げる。
+`herdr-reset --handoff "<引き継ぎ文>"` で、立て直したあとの司令塔へ作業を引き継げる。
 
 ```sh
-hub-reset --handoff "目的: ...
+herdr-reset --handoff "目的: ...
 現状: ...
 次の手順: ..."
 ```
@@ -156,11 +156,11 @@ setup = "todo/contrib/herdr/todo-herdr"
 agents = ["todo"]
 ```
 
-`hub-reset` は既存のワークスペースを閉じてからスクリプトを実行する。そのため `setup` のワークスペースを単体でリセットすると、サイドバーの末尾へ移る。
+`herdr-reset` は既存のワークスペースを閉じてからスクリプトを実行する。そのため `setup` のワークスペースを単体でリセットすると、サイドバーの末尾へ移る。
 
 ### rules と agent-settings.json
 
-`hub-reset` と `hub-work` が起動する claude に、次を渡す。agent の `args` とは併用できる（`--settings` と `--append-system-prompt-file` を `args` に書くと衝突として止まる）。
+`herdr-reset` と `hub-work` が起動する claude に、次を渡す。agent の `args` とは併用できる（`--settings` と `--append-system-prompt-file` を `args` に書くと衝突として止まる）。
 
 - `--append-system-prompt-file`: `<hub-env>/rules/*.md` を連結した生成ファイル（rules が無ければ渡さない）。`$XDG_STATE_HOME/hub/envs/<環境>-<ハッシュ>/agent-rules.md` に置く
 - `--settings`: `<hub-env>/agent-settings.json`（あれば）

@@ -308,7 +308,7 @@ def cmd_resume(a: argparse.Namespace, backend: Backend, env: Path, wd: Path) -> 
     finally:
         write_status(path, meta, body)
         commit(wd, f"resume {a.name}")
-    undelivered = send_briefs(backend, started, brief(env, a.name, path, "hub-reset などで中断した作業の再開です。status.md の進捗から続けてください。", meta),
+    undelivered = send_briefs(backend, started, brief(env, a.name, path, "herdr-reset などで中断した作業の再開です。status.md の進捗から続けてください。", meta),
                               path.parent)
     commit(wd, f"brief {a.name}")
     print(f"作業 {a.name} を立て直しました（起動: {', '.join(started) or 'なし'}）")
