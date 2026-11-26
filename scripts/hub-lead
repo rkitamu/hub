@@ -1,0 +1,97 @@
+#!/usr/bin/env -S uv run --quiet --script
+# /// script
+# requires-python = ">=3.11"
+# dependencies = []
+# ///
+"""自分の作業を進める（lead のコマンド）。作業名は環境変数 HUB_WORK から取る。
+
+usage:
+  hub-lead assign <repo> --request <指示文> [--kind <kind>]
+                              子リポジトリ（環境からの相対パス）の worktree に crew を立てて振る。
+                              同じリポジトリにもう一度振ると、今の crew に指示を送る
+  hub-lead send <名前> <指示>   自分の crew か常駐エージェント（commander 以外の [[agent]]）に送る
+  hub-lead read <名前> [--lines <N>]
+                              自分の crew か常駐エージェントの画面を読む
+  hub-lead notify <要約>       commander へ通知する（hub-env や hub の道具に影響する変更をマージしたときだけ）
+  hub-lead list               自分の作業のエージェントと状態
+  hub-lead resume             欠けている crew のタブを立て直す
+  hub-lead finish             crew のタブと worktree を閉じ、archive へ移し、最後にこのタブを閉じる
+
+終了コード: 0 成功 / 1 失敗 / 3 backend が無いので送れない
+"""
+
+from __future__ import annotations
+
+import argparse
+import sys
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "lib"))
+import hub_work as hw  # noqa: E402
+from hub_backend import backend_for  # noqa: E402
+from hub_config import COMMANDER  # noqa: E402
+from hublib import HubError, find_env, read_status, work_dir  # noqa: E402
+
+NO_BACKEND = 3
+
+
+def main() -> int:
+    p = argparse.ArgumentParser(prog="hub-lead", description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    sub = p.add_subparsers(dest="cmd", required=True)
+    s = sub.add_parser("assign")
+    s.add_argument("repo")
+    s.add_argument("--request", required=True)
+    s.add_argument("--kind", default="claude")
+    s = sub.add_parser("send")
+    s.add_argument("name")
+    s.add_argument("text")
+    r = sub.add_parser("read")
+    r.add_argument("name")
+    r.add_argument("--lines", type=int, default=120)
+    sub.add_parser("notify").add_argument("text")
+    sub.add_parser("list")
+    sub.add_parser("resume")
+    sub.add_parser("finish")
+    a = p.parse_args()
+    try:
+        hw.require_role("lead", f"hub-lead {a.cmd}")
+        name = hw.own_work()
+        env, cfg = find_env()
+        backend = backend_for(env, cfg)
+        backend.check()
+        wd = work_dir(env)
+        if a.cmd == "assign":
+            return hw.assign(backend, env, wd, name, a.repo, a.request, a.kind)
+        if a.cmd == "resume":
+            return hw.resume(backend, env, wd, name, roles=("crew",))
+        if a.cmd == "finish":
+            return hw.finish(backend, env, wd, name, by_lead=True)
+        meta, _ = read_status(hw.status_path(wd, name))
+        if a.cmd == "list":
+            alive = {x.get("name"): x.get("status") for x in backend.list_agents()}
+            for x in meta["agents"]:
+                state = alive.get(x["name"], "不明" if backend.manual else "停止")
+                print(f"{x['name']}\t{x.get('role', '-')}\t{state}\t{x['workspace']} / {x.get('tab', '-')}\t{x['cwd']}")
+            return 0
+        if backend.manual:
+            print(f"backend が無いので送れません（hub.toml の backend: {backend.name}）", file=sys.stderr)
+            return NO_BACKEND
+        if a.cmd == "notify":
+            return hw.notify(backend, COMMANDER, a.text, "status.md に書いてあれば、司令塔はそれを読みます")
+        if a.name not in (targets := hw.lead_targets(env, cfg, meta)):
+            raise HubError(f"{a.name} には送れません。lead が送れるのは、自分の crew と常駐エージェントだけです: "
+                           f"{', '.join(sorted(targets)) or 'なし'}")
+        if a.cmd == "read":
+            sys.stdout.write(backend.read(a.name, a.lines))
+            return 0
+        if (result := backend.send(a.name, a.text)) != "ok":
+            print(f"{a.name} に届きませんでした（{result}）", file=sys.stderr)
+            return 1
+        return 0
+    except HubError as e:
+        print(f"error: {e}", file=sys.stderr)
+        return 1
+
+
+if __name__ == "__main__":
+    sys.exit(main())

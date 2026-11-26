@@ -90,6 +90,10 @@ def create(env: Path, cfg: dict) -> "HerdrBackend":
     return HerdrBackend(env, cfg)
 
 
+def _env_args(env: dict | None) -> list[str]:
+    return [x for k, v in (env or {}).items() for x in ("--env", f"{k}={v}")]
+
+
 def _worktree_info(ws: dict) -> dict:
     return ws.get("worktree") or {}
 
@@ -130,7 +134,8 @@ class HerdrBackend(Backend):
 
     # ── 組み立て ──
 
-    def open_place(self, label: str, cwd: Path, title: str, worktree: dict | None = None) -> dict:
+    def open_place(self, label: str, cwd: Path, title: str, worktree: dict | None = None,
+                   env: dict | None = None) -> dict:
         data: dict = {}
         if worktree:
             before = {w["workspace_id"] for w in workspaces()}
@@ -141,13 +146,41 @@ class HerdrBackend(Backend):
                 if w["workspace_id"] not in before and w["workspace_id"] != res["workspace"]["workspace_id"]:
                     data["source"] = {"id": w["workspace_id"], "label": w["label"]}
         else:
-            res = herdr("workspace", "create", "--cwd", str(cwd), "--label", label, "--no-focus")["result"]
+            res = herdr("workspace", "create", "--cwd", str(cwd), "--label", label, *_env_args(env), "--no-focus")["result"]
         herdr("tab", "rename", res["tab"]["tab_id"], title)
-        return {"place": res["workspace"]["workspace_id"], "pane": res["root_pane"]["pane_id"], "data": data}
+        return {"place": res["workspace"]["workspace_id"], "pane": res["root_pane"]["pane_id"],
+                "tab": res["tab"]["tab_id"], "data": data}
 
-    def add_slot(self, place: str, cwd: Path, title: str) -> str:
-        res = herdr("tab", "create", "--workspace", place, "--cwd", str(cwd), "--label", title, "--no-focus")["result"]
+    def add_slot(self, place: str, cwd: Path, title: str, env: dict | None = None) -> str:
+        res = herdr("tab", "create", "--workspace", place, "--cwd", str(cwd), "--label", title, *_env_args(env),
+                    "--no-focus")["result"]
         return res["root_pane"]["pane_id"]
+
+    def list_tabs(self, label: str) -> list[dict]:
+        ws = next((w for w in workspaces() if w["label"] == label), None)
+        if not ws:
+            return []
+        tabs = herdr("tab", "list", "--workspace", ws["workspace_id"])["result"]["tabs"]
+        return [{"id": t["tab_id"], "title": t.get("label")} for t in tabs]
+
+    def close_tab(self, tab: str) -> None:
+        herdr("tab", "close", tab)
+
+    def current_tab(self) -> str | None:
+        return os.environ.get("HERDR_TAB_ID") or None
+
+    def close_tab_later(self, tab: str) -> None:
+        # NOTE: 自分のタブを閉じると、このプロセスも終わる。端末から切り離し、表示が出きるのを待ってから閉じる。
+        subprocess.Popen(["sh", "-c", 'sleep 2; herdr tab close "$1"', "sh", tab], stdin=subprocess.DEVNULL,
+                         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, start_new_session=True)
+
+    def place_for_dir(self, path: Path) -> str | None:
+        try:
+            wss = layout(self.env, self.cfg)
+        except HubError:
+            return None
+        return next((ws["label"] for ws in wss if ws.get("cwd") and (self.env / ws["cwd"]).resolve() == path.resolve()),
+                    None)
 
     def start_agent(self, pane: str, spec: dict) -> str:
         cmd = ["agent", "start", spec["name"], "--kind", spec.get("kind", "claude"), "--pane", pane]

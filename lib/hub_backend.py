@@ -5,8 +5,10 @@ core（scripts/ と lib/）は、ここに定義した操作だけで backend �
 
 用語:
 - 場所（place）: backend がエージェントを置く単位。herdr ではワークスペース。status.md の workspace はそのラベル。
-- 置き場（pane）: 場所の中で、エージェントを 1 人起動できるところ。
-- AgentSpec: {"name", "kind", "cwd", "argv"}。argv は hub の引数を足し終えた claude の引数で、backend は加工しない。
+- 置き場（pane）: 場所の中で、エージェントを 1 人起動できるところ。herdr ではタブ（の最初のペイン）。
+- タブ（tab）: 置き場を持つ、名前の付いた単位。作業の lead・crew は、場所の中のタブとして置く。
+- AgentSpec: {"name", "kind", "cwd", "argv", "env"}。argv は hub の引数を足し終えた claude の引数で、backend は加工しない。
+  env はエージェントに渡す環境変数（HUB_WORK・HUB_ROLE）。backend は置き場を作るときに渡す。
 """
 
 from __future__ import annotations
@@ -56,17 +58,37 @@ class Backend:
         """このプロセスがいる場所のラベル。場所の外なら None。"""
         return None
 
-    def open_place(self, label: str, cwd: Path, title: str, worktree: dict | None = None) -> dict:
-        """場所を作り、{"place": <id>, "pane": <最初の置き場>, "data": {...}} を返す。
+    def open_place(self, label: str, cwd: Path, title: str, worktree: dict | None = None,
+                   env: dict | None = None) -> dict:
+        """場所を作り、{"place": <id>, "pane": <最初の置き場>, "tab": <最初のタブ>, "data": {...}} を返す。
 
-        worktree は {"repo", "path", "branch"}。checkout は core が作成済み。
+        worktree は {"repo", "path", "branch"}（旧形式の作業だけが使う）。checkout は core が作成済み。
         data は backend 用の値で、core は worktree の記録に足して保存し、close_place に返す。
+        env は最初の置き場に渡す環境変数。
         """
         raise NotImplementedError
 
-    def add_slot(self, place: str, cwd: Path, title: str) -> str:
-        """既存の場所に置き場を足し、その id を返す。"""
+    def add_slot(self, place: str, cwd: Path, title: str, env: dict | None = None) -> str:
+        """既存の場所（id）に、title という名前のタブで置き場を足し、その id を返す。"""
         raise NotImplementedError
+
+    def list_tabs(self, label: str) -> list[dict]:
+        """場所（ラベル）のタブ: [{"id", "title"}]。場所が無ければ空。"""
+        return []
+
+    def close_tab(self, tab: str) -> None:
+        """タブを閉じる。"""
+
+    def current_tab(self) -> str | None:
+        """このプロセスがいるタブの id。タブの外なら None。"""
+        return None
+
+    def close_tab_later(self, tab: str) -> None:
+        """このプロセスが終わった後に、タブを裏で閉じる（自分のタブを閉じるとき）。"""
+
+    def place_for_dir(self, path: Path) -> str | None:
+        """そのディレクトリを受け持つ、レイアウトの場所のラベル。無ければ None。"""
+        return None
 
     def start_agent(self, pane: str, spec: dict) -> str:
         """起動して "started" を返す。確認ダイアログで止まっていれば "needs_confirm"、起動できない backend は "manual"。失敗は BackendError。"""
@@ -98,7 +120,8 @@ class Backend:
 
     def launch_hint(self, spec: dict) -> str:
         """人が手で起動するためのコマンド。"""
-        cmd = [spec.get("kind", "claude"), *spec.get("argv", [])]
+        env = [f"{k}={v}" for k, v in (spec.get("env") or {}).items()]
+        cmd = [*(["env", *env] if env else []), spec.get("kind", "claude"), *spec.get("argv", [])]
         return f"cd {shlex.quote(str(spec['cwd']))} && {shlex.join(cmd)}"
 
 
@@ -114,10 +137,11 @@ class NoneBackend(Backend):
     def list_places(self) -> list[dict]:
         return []
 
-    def open_place(self, label: str, cwd: Path, title: str, worktree: dict | None = None) -> dict:
-        return {"place": label, "pane": label, "data": {}}
+    def open_place(self, label: str, cwd: Path, title: str, worktree: dict | None = None,
+                   env: dict | None = None) -> dict:
+        return {"place": label, "pane": label, "tab": label, "data": {}}
 
-    def add_slot(self, place: str, cwd: Path, title: str) -> str:
+    def add_slot(self, place: str, cwd: Path, title: str, env: dict | None = None) -> str:
         return place
 
     def start_agent(self, pane: str, spec: dict) -> str:

@@ -9,8 +9,10 @@ usage:
   hub-agent list                       動いているエージェントと状態
   hub-agent send <名前> <依頼>          エージェントに送る
   hub-agent read <名前> [--lines <N>]   エージェントの画面を読む
-  hub-agent notify <作業名と要約>        司令塔へ通知する。確認待ちなら待って送り直し、timeout なら画面で確かめる
+  hub-agent notify <作業名と要約>        司令塔へ通知する（旧形式の作業エージェント用）
   hub-agent launch <名前> [--print]     hub.toml の [[agent]] の通りに、この端末で claude を起動する（--print は表示だけ）
+
+commander のコマンド。lead は hub-lead、crew は hub-crew を使う（HUB_ROLE があれば list のほかは止まる）。
 
 終了コード: 0 成功 / 1 失敗 / 3 backend が無いので送れない
 """
@@ -21,25 +23,15 @@ import argparse
 import os
 import shlex
 import sys
-import time
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "lib"))
+import hub_work as hw  # noqa: E402
 from hub_backend import Backend, backend_for  # noqa: E402
 from hub_config import COMMANDER, SESSION_RECORD, find_agent  # noqa: E402
 from hublib import HubError, agent_argv, claude_launch_args, commander_launch, env_state_dir, find_env  # noqa: E402
 
 NO_BACKEND = 3
-# 確認待ちの司令塔に送り直し続ける秒数と間隔。テストでは環境変数で短くする。
-NOTIFY_WAIT = 120.0
-NOTIFY_INTERVAL = 5.0
-
-
-def env_seconds(name: str, default: float) -> float:
-    try:
-        return float(os.environ.get(name) or default)
-    except ValueError:
-        return default
 
 
 def no_backend(backend: Backend) -> int:
@@ -72,35 +64,14 @@ def cmd_read(a, backend: Backend, env: Path, cfg: dict) -> int:
     return 0
 
 
-def seen(backend: Backend, name: str, text: str) -> bool:
-    """送った文が画面に出ているか。長い文は折り返しや省略があるので、先頭の 1 行の一部で確かめる。"""
-    head = text.strip().splitlines()[0][:40] if text.strip() else ""
-    return bool(head) and head in backend.read(name, 400)
-
-
 def cmd_notify(a, backend: Backend, env: Path, cfg: dict) -> int:
     if backend.manual:
         return no_backend(backend)
-    name = COMMANDER
-    deadline = time.monotonic() + env_seconds("HUB_AGENT_NOTIFY_WAIT", NOTIFY_WAIT)
-    interval = env_seconds("HUB_AGENT_NOTIFY_INTERVAL", NOTIFY_INTERVAL)
-    while True:
-        result = backend.send(name, a.text)
-        if result == "ok":
-            print(f"{name} へ通知しました")
-            return 0
-        # timeout は届いている場合があるので、二重に送らないよう画面で確かめる
-        if result == "timeout" and seen(backend, name, a.text):
-            print(f"{name} の画面に届いていることを確かめました")
-            return 0
-        if result not in ("blocked", "timeout") or time.monotonic() >= deadline:
-            print(f"{name} へ届きませんでした（{result}）。status.md に書いてあれば、司令塔はそれを読みます", file=sys.stderr)
-            return 1
-        time.sleep(interval)
+    return hw.notify(backend, COMMANDER, a.text, "status.md に書いてあれば、司令塔はそれを読みます")
 
 
 def launch_argv(env: Path, cfg: dict, agent: dict) -> list[str]:
-    launch = claude_launch_args(env)
+    launch = claude_launch_args(env, "commander" if agent["name"] == COMMANDER else None)
     if agent["name"] == COMMANDER and agent["kind"] == "claude":
         record = env_state_dir(env) / SESSION_RECORD
         launch = commander_launch(env, agent, agent["path"], launch, record) or launch
@@ -140,6 +111,8 @@ def main() -> int:
     la.add_argument("--print", action="store_true")
     a = p.parse_args()
     try:
+        if a.cmd != "list":
+            hw.require_role(None, f"hub-agent {a.cmd}")
         env, cfg = find_env()
         backend = backend_for(env, cfg)
         if a.cmd != "launch":

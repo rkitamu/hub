@@ -54,6 +54,42 @@ class GuardTest(unittest.TestCase):
         (tree / ".git").mkdir()
         self.assertEqual(run(tree, tree / "MAP.md"), 2)
 
+    def run_allow(self, dirs, path, tool="Write", cwd=None):
+        args = [x for d in dirs for x in ("--allow", str(d))]
+        key = "notebook_path" if tool == "NotebookEdit" else "file_path"
+        data = json.dumps({"tool_name": tool, "tool_input": {key: str(path)}, "cwd": str(cwd or self.root)})
+        return subprocess.run([str(GUARD), *args], input=data, capture_output=True, text=True)
+
+    def test_allow_mode(self):
+        doc = self.root / "work/w"
+        tree = self.env / ".hub-worktrees/w/todo"
+        for d in (doc, tree):
+            d.mkdir(parents=True)
+        # lead: 作業のディレクトリだけ
+        self.assertEqual(self.run_allow([doc], doc / "status.md").returncode, 0)
+        self.assertEqual(self.run_allow([doc], "runbook.md", cwd=doc).returncode, 0)
+        p = self.run_allow([doc], self.root / "MAP.md")
+        self.assertEqual(p.returncode, 2)
+        self.assertIn("この作業で書けるのは", p.stderr)
+        self.assertEqual(self.run_allow([doc], self.root / "work/other/status.md").returncode, 2)
+        self.assertEqual(self.run_allow([doc], doc / "../x/status.md").returncode, 2)
+        # crew: 担当の worktree と作業のディレクトリ
+        for tool in ("Edit", "Write", "NotebookEdit"):
+            self.assertEqual(self.run_allow([tree, doc], tree / "a.py", tool).returncode, 0)
+        self.assertEqual(self.run_allow([tree, doc], doc / "crew-todo.md").returncode, 0)
+        self.assertEqual(self.run_allow([tree, doc], self.child / "a.md").returncode, 2)
+        # 中から外へのリンクは、実際の書き込み先で判定する
+        (tree / "out").symlink_to(self.child)
+        self.assertEqual(self.run_allow([tree, doc], tree / "out/a.md").returncode, 2)
+        # 対象外のツールは通す
+        data = json.dumps({"tool_name": "Read", "tool_input": {"file_path": str(self.child / "a.md")}})
+        self.assertEqual(subprocess.run([str(GUARD), "--allow", str(doc)], input=data, capture_output=True, text=True).returncode, 0)
+
+    def test_allow_mode_rejects_bad_args(self):
+        for args in (["--allow"], ["--allow", "rel"], ["--root", str(self.root), "--allow", str(self.root)], []):
+            p = subprocess.run([str(GUARD), *args], input="{}", capture_output=True, text=True)
+            self.assertEqual(p.returncode, 2, args)
+
     def test_allows_relative_inside(self):
         self.assertEqual(self.call("MAP.md"), 0)
         self.assertEqual(self.call("../MAP.md", cwd=self.root / "sub"), 0)

@@ -17,6 +17,7 @@ from contextlib import contextmanager
 from pathlib import Path
 
 ENVS_FILE = Path(os.environ.get("XDG_CONFIG_HOME") or Path.home() / ".config") / "hub/envs"
+HUB_ROOT = Path(__file__).resolve().parent.parent
 STATE_DIR = Path(os.environ.get("XDG_STATE_HOME") or Path.home() / ".local/state") / "hub"
 DEFAULT_TODO_FILE = "todo/data/active.md"
 FRONT_MATTER_KEYS = ("state", "todo", "repos", "workspace", "agents", "worktrees")
@@ -94,40 +95,95 @@ def rule_files(env: Path) -> list[tuple[str, Path]]:
     return [(f"hub-env/rules/{f.name}", f) for f in sorted((env / "hub-env/rules").glob("*.md")) if f.is_file()]
 
 
-def build_rules(env: Path) -> Path | None:
-    """rules を連結した生成ファイルを state ディレクトリに作る。rules が無ければ None。"""
-    target = env_state_dir(env) / "agent-rules.md"
-    files = rule_files(env)
+ROLES = ("commander", "lead", "crew")
+
+
+def role_file(role: str) -> Path:
+    return HUB_ROOT / "roles" / f"{role}.md"
+
+
+def _replace(target: Path, text: str) -> None:
+    target.parent.mkdir(parents=True, exist_ok=True)
+    # NOTE: 起動中の別のエージェントが読みかけのファイルを見ないよう、置き換えで更新する。
+    fd, tmp = tempfile.mkstemp(dir=target.parent, prefix=f".{target.name}.")
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            f.write(text)
+        os.replace(tmp, target)
+    finally:
+        Path(tmp).unlink(missing_ok=True)
+
+
+def build_rules(env: Path, role: str | None = None) -> Path | None:
+    """役割のファイル（role があれば）と rules を連結した生成ファイルを state ディレクトリに作る。どちらも無ければ None。
+
+    role が無いときは agent-rules.md（常駐エージェント用）、あるときは <role>-prompt.md。
+    """
+    if role is not None and role not in ROLES:
+        raise HubError(f"役割が不正です: {role}")
+    target = env_state_dir(env) / (f"{role}-prompt.md" if role else "agent-rules.md")
+    files = ([(f"hub/roles/{role}.md", role_file(role))] if role else []) + rule_files(env)
     if not files:
         target.unlink(missing_ok=True)
         return None
     try:
         text = "\n\n".join(f"<!-- {name} -->\n{f.read_text().strip()}" for name, f in files) + "\n"
     except (OSError, UnicodeDecodeError) as e:
-        raise HubError(f"rules を読めません: {e}")
-    target.parent.mkdir(parents=True, exist_ok=True)
-    # NOTE: 起動中の別のエージェントが読みかけのファイルを見ないよう、置き換えで更新する。
-    fd, tmp = tempfile.mkstemp(dir=target.parent, prefix=".agent-rules.")
-    with os.fdopen(fd, "w") as f:
-        f.write(text)
-    os.replace(tmp, target)
+        raise HubError(f"{'役割のファイルか ' if role else ''}rules を読めません: {e}")
+    _replace(target, text)
     return target
 
 
-def claude_launch_args(env: Path) -> list[str]:
-    """環境のエージェント全員に渡す claude の引数。設定が壊れていれば、何かを閉じる前に止まれるよう例外にする。"""
-    args: list[str] = []
+def agent_settings(env: Path) -> dict | None:
+    """<hub-env>/agent-settings.json の中身。無ければ None。壊れていれば HubError。"""
     settings = env / "hub-env/agent-settings.json"
-    if settings.exists():
-        try:
-            if not isinstance(json.loads(settings.read_text()), dict):
-                raise ValueError("オブジェクトではありません")
-        except (OSError, ValueError) as e:
-            raise HubError(f"agent-settings.json を読めません: {settings}: {e}")
-        args += ["--settings", str(settings)]
-    if rules := build_rules(env):
+    if not settings.exists():
+        return None
+    try:
+        data = json.loads(settings.read_text())
+        if not isinstance(data, dict):
+            raise ValueError("オブジェクトではありません")
+    except (OSError, ValueError) as e:
+        raise HubError(f"agent-settings.json を読めません: {settings}: {e}")
+    return data
+
+
+def claude_launch_args(env: Path, role: str | None = None) -> list[str]:
+    """環境のエージェントに渡す claude の引数。設定が壊れていれば、何かを閉じる前に止まれるよう例外にする。"""
+    args: list[str] = []
+    if agent_settings(env) is not None:
+        args += ["--settings", str(env / "hub-env/agent-settings.json")]
+    if rules := build_rules(env, role):
         args += ["--append-system-prompt-file", str(rules)]
     return args
+
+
+def settings_with_hooks(env: Path, target: Path, hooks: dict[str, list]) -> Path:
+    """agent-settings.json にフックを足した設定を target に生成する。"""
+    settings = agent_settings(env) or {}
+    have = settings.setdefault("hooks", {})
+    if not isinstance(have, dict):
+        raise HubError(f"agent-settings.json の hooks を読めません: {env / 'hub-env/agent-settings.json'}")
+    for event, entries in hooks.items():
+        if not isinstance(have.setdefault(event, []), list):
+            raise HubError(f"agent-settings.json の hooks.{event} を読めません")
+        have[event].extend(entries)
+    _replace(target, json.dumps(settings, ensure_ascii=False, indent=2) + "\n")
+    return target
+
+
+def replace_settings(launch: list[str], settings: Path) -> list[str]:
+    """launch の --settings を settings に差し替える（無ければ足す）。"""
+    rest: list[str] = []
+    skip = False
+    for a in launch:
+        if skip:
+            skip = False
+        elif a == "--settings":
+            skip = True
+        else:
+            rest.append(a)
+    return ["--settings", str(settings), *rest]
 
 
 def agent_argv(kind: str, launch: list[str], own: list[str], extra: list[str] | None = None) -> list[str]:
@@ -142,7 +198,6 @@ def agent_argv(kind: str, launch: list[str], own: list[str], extra: list[str] | 
 
 # ── 司令塔のセッションの記録と再開 ─────────────────────────────────
 
-HUB_ROOT = Path(__file__).resolve().parent.parent
 SESSION_FLAGS = ("--resume", "-r", "--continue", "-c", "--session-id", "--fork-session")
 
 
@@ -157,33 +212,11 @@ def commander_launch(env: Path, agent: dict, cwd: Path, launch: list[str], recor
     """
     if agent.get("kind", "claude") != "claude" or has_flag(agent.get("args", []), "--settings"):
         return None
-    source = env / "hub-env/agent-settings.json"
-    settings = json.loads(source.read_text()) if source.exists() else {}
-    hooks = settings.setdefault("hooks", {})
-    if not isinstance(hooks, dict) or not isinstance(hooks.setdefault("SessionStart", []), list):
-        raise HubError(f"agent-settings.json の hooks を読めません: {source}")
     script = HUB_ROOT / "scripts/hub-session-record"
     command = shlex.join([str(script), "--state", str(record), "--cwd", str(cwd)])
-    hooks["SessionStart"].append({"hooks": [{"type": "command", "command": command}]})
     target = record.parent / record.name.replace("-session.json", "-agent-settings.json")
-    target.parent.mkdir(parents=True, exist_ok=True)
-    fd, tmp = tempfile.mkstemp(dir=target.parent, prefix=".hub-agent-settings.")
-    try:
-        with os.fdopen(fd, "w", encoding="utf-8") as f:
-            json.dump(settings, f, ensure_ascii=False, indent=2)
-        os.replace(tmp, target)
-    finally:
-        Path(tmp).unlink(missing_ok=True)
-    rest: list[str] = []
-    skip = False
-    for a in launch:
-        if skip:
-            skip = False
-        elif a == "--settings":
-            skip = True
-        else:
-            rest.append(a)
-    return ["--settings", str(target), *rest]
+    settings_with_hooks(env, target, {"SessionStart": [{"hooks": [{"type": "command", "command": command}]}]})
+    return replace_settings(launch, target)
 
 
 def commander_resume_args(name: str, agent: dict, cwd: Path, record: Path) -> list[str]:

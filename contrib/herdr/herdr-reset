@@ -18,7 +18,10 @@ usage:
 引き継ぎ文は、届くまで環境の state ディレクトリの handoff.md（権限 600）に残る。秘密情報は書かない。
 未配送の handoff.md があるときは上書きせずに止まる。届いていないことを確かめて送り直すか、不要なら消す。
 
-司令塔は [[agent]] の commander。
+司令塔は [[agent]] の commander。roles/commander.md を渡して起動する。
+部分リセットでは、進行中の作業（work/*/status.md）の lead・crew のタブを残し、hub.toml のタブをその後ろに作り直す。
+setup で組み立てるワークスペースに作業のタブがあれば、何も閉じずに止まる。全体のリセットは作業のタブも閉じる（hub-work resume で立て直す）。
+lead・crew（HUB_ROLE がある）からは実行できない。
 herdr のペインの中で実行する。環境は、HERDR_SESSION を [herdr] の session に書いた ~/.config/hub/envs の環境。
 自動では実行されない。OS の再起動などで herdr がレイアウトだけを戻したときも、手で実行する。
 """
@@ -40,7 +43,8 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent.parent / "lib"))
 from hub_backend import load_module  # noqa: E402
 from hublib import HubError as ResetError  # noqa: E402
 from hub_config import COMMANDER, SESSION_RECORD  # noqa: E402
-from hublib import agent_argv, claude_launch_args, commander_launch, commander_resume_args, env_state_dir, find_env  # noqa: E402
+from hublib import (agent_argv, claude_launch_args, commander_launch, commander_resume_args, env_state_dir, find_env,  # noqa: E402
+                    read_status, work_dir)
 
 # NOTE: herdr-reset は herdr のレイアウトそのものを組み立てるので、backend の操作ではなく herdr を直接呼ぶ。
 _herdr = load_module("herdr")
@@ -62,6 +66,7 @@ HANDOFF_PREAMBLE = ("これは herdr-reset 前の司令塔からの引き継ぎ�
 
 ENV_DIR: Path  # main() で決める
 LAUNCH: list[str] = []  # main() で決める。全エージェントに渡す claude の引数
+CMDR_LAUNCH: list[str] = []  # main() で決める。司令塔に渡す claude の引数（役割のファイルを含む）
 HUB_LAUNCH: list[str] | None = None  # main() で決める。hub エージェントに LAUNCH の代わりに渡す引数
 RESUME_ARGS: list[str] = []  # main() で決める。hub エージェントにだけ足す引数
 STARTING: list[threading.Thread] = []  # 起動を待っているエージェント。wait_agents() で待つ
@@ -167,7 +172,7 @@ def start_agent(pane: str, ag: dict) -> None:
     name = ag["name"]
     cmd = ["agent", "start", name, "--kind", ag.get("kind", "claude"), "--pane", pane]
     is_hub = name == HUB_AGENT and ag.get("kind", "claude") == "claude"
-    launch = HUB_LAUNCH if is_hub and HUB_LAUNCH is not None else LAUNCH
+    launch = (HUB_LAUNCH if HUB_LAUNCH is not None else CMDR_LAUNCH) if is_hub else LAUNCH
     if args := agent_argv(ag.get("kind", "claude"), launch, ag.get("args", []), RESUME_ARGS if is_hub else None):
         cmd += ["--", *args]
     deadline = time.monotonic() + START_RETRY
@@ -323,8 +328,38 @@ def reset_setup_workspace(ws: dict, existing: list[dict]) -> None:
             herdr("workspace", "close", placeholder, check=False)
 
 
+def work_tabs() -> dict[str, set[str]]:
+    """進行中の作業が記録したタブ: {ワークスペースのラベル: {タブ名}}。読めない記録は飛ばす。"""
+    out: dict[str, set[str]] = {}
+    for f in sorted(work_dir(ENV_DIR).glob("*/status.md")):
+        try:
+            meta, _ = read_status(f)
+        except (OSError, ResetError) as e:
+            print(f"warning: 作業の記録を読めないので飛ばします: {f}: {e}", file=sys.stderr)
+            continue
+        if meta["state"] == "done":
+            continue
+        for a in meta["agents"]:
+            if a.get("tab"):
+                out.setdefault(a["workspace"], set()).add(a["tab"])
+    return out
+
+
+def check_work_tabs(cfg: dict, labels: list[str]) -> None:
+    """setup のワークスペースはまるごと閉じるので、作業のタブがあれば何も閉じる前に止まる。"""
+    keep = work_tabs()
+    for ws in cfg["workspace"]:
+        if ws["label"] in labels and ws.get("_setup") and keep.get(ws["label"]):
+            titles = {t["label"] for w in workspaces() if w["label"] == ws["label"]
+                      for t in herdr("tab", "list", "--workspace", w["workspace_id"])["result"]["tabs"]}
+            if found := sorted(keep[ws["label"]] & titles):
+                raise ResetError(f"{ws['label']} には作業のタブ（{', '.join(found)}）があります。setup のワークスペースは"
+                                 "まるごと作り直すので、先にその作業を閉じるか、全体の herdr-reset を使ってください")
+
+
 def reset_some(cfg: dict, labels: list[str]) -> None:
     by_label = {ws["label"]: ws for ws in cfg["workspace"]}
+    keep = work_tabs()
     for label in labels:
         ws = by_label[label]
         existing = [w for w in workspaces() if w["label"] == label]
@@ -338,7 +373,9 @@ def reset_some(cfg: dict, labels: list[str]) -> None:
         else:
             # 既存のワークスペースの中で、新しいタブを作ってから古いタブを閉じる（並び順を保つため）
             ws_id = existing[0]["workspace_id"]
-            old_tabs = [t["tab_id"] for t in herdr("tab", "list", "--workspace", ws_id)["result"]["tabs"]]
+            # NOTE: 進行中の作業のタブ（lead・crew）は残す。hub.toml のタブはその後ろに並ぶ。
+            old_tabs = [t["tab_id"] for t in herdr("tab", "list", "--workspace", ws_id)["result"]["tabs"]
+                        if t.get("label") not in keep.get(label, set())]
             add_tabs(ws_id, ws, agents)
             for t in old_tabs:
                 herdr("tab", "close", t)
@@ -554,7 +591,7 @@ def parse_args(argv: list[str]) -> tuple[list[str], str | None, bool, bool, str 
 
 
 def main() -> int:
-    global ENV_DIR, LAUNCH, HUB_LAUNCH, RESUME_ARGS
+    global ENV_DIR, LAUNCH, CMDR_LAUNCH, HUB_LAUNCH, RESUME_ARGS
     labels, text, resume, show_help, arg_error = parse_args(sys.argv[1:])
     if show_help:
         print(__doc__.strip())
@@ -565,6 +602,8 @@ def main() -> int:
     try:
         if arg_error:
             raise ResetError(arg_error)
+        if role := os.environ.get("HUB_ROLE"):
+            raise ResetError(f"herdr-reset は {role} からは実行できません。立て直しが要るときは、ユーザーに伝えて司令塔に頼んでもらってください")
         bad = [a for a in labels if a.startswith("-")]
         if bad:
             raise ResetError(f"知らないオプションです: {bad[0]}")
@@ -580,6 +619,7 @@ def main() -> int:
         check_config(cfg)
         # 何かを閉じる前に、起動引数の問題を見つける
         LAUNCH = claude_launch_args(ENV_DIR)
+        CMDR_LAUNCH = claude_launch_args(ENV_DIR, HUB_AGENT)
         for ws in cfg["workspace"]:
             for tab in ws.get("tab", []):
                 for pane in tab.get("pane", []):
@@ -595,7 +635,7 @@ def main() -> int:
         if resume:
             RESUME_ARGS = resume_args(pane, record)
         if pane:
-            HUB_LAUNCH = commander_launch(ENV_DIR, pane["agent"], pane["_cwd"], LAUNCH, record)
+            HUB_LAUNCH = commander_launch(ENV_DIR, pane["agent"], pane["_cwd"], CMDR_LAUNCH, record)
 
         if text is not None or resumed or resume:
             if not hub_is_target(cfg, labels):
@@ -606,6 +646,8 @@ def main() -> int:
                 for ws in cfg["workspace"]:
                     if ws["label"] in labels and ws.get("_setup"):
                         check_worktree_links(ws, [w for w in every if w["label"] == ws["label"]], every)
+        if labels:
+            check_work_tabs(cfg, labels)
         if text is not None:
             save_handoff(handoff_path, build_handoff(text))
             handoff = handoff_path

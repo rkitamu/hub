@@ -1,0 +1,51 @@
+#!/usr/bin/env -S uv run --quiet --script
+# /// script
+# requires-python = ">=3.11"
+# dependencies = []
+# ///
+"""自分の lead に報告する（crew のコマンド）。作業名は環境変数 HUB_WORK から取る。
+
+usage:
+  hub-crew notify <要約>   lead へ通知する。確認待ちなら待って送り直し、timeout なら画面で確かめる
+
+終了コード: 0 成功 / 1 失敗 / 3 backend が無いので送れない
+"""
+
+from __future__ import annotations
+
+import argparse
+import sys
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "lib"))
+import hub_work as hw  # noqa: E402
+from hub_backend import backend_for  # noqa: E402
+from hublib import HubError, find_env, read_status, work_dir  # noqa: E402
+
+NO_BACKEND = 3
+
+
+def main() -> int:
+    p = argparse.ArgumentParser(prog="hub-crew", description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    sub = p.add_subparsers(dest="cmd", required=True)
+    sub.add_parser("notify").add_argument("text")
+    a = p.parse_args()
+    try:
+        hw.require_role("crew", f"hub-crew {a.cmd}")
+        name = hw.own_work()
+        env, cfg = find_env()
+        backend = backend_for(env, cfg)
+        backend.check()
+        if backend.manual:
+            print(f"backend が無いので送れません（hub.toml の backend: {backend.name}）。lead は crew のメモを読みます",
+                  file=sys.stderr)
+            return NO_BACKEND
+        meta, _ = read_status(hw.status_path(work_dir(env), name))
+        return hw.notify(backend, hw.lead_of(meta)["name"], a.text, "crew のメモに書いてあれば、lead はそれを読みます")
+    except HubError as e:
+        print(f"error: {e}", file=sys.stderr)
+        return 1
+
+
+if __name__ == "__main__":
+    sys.exit(main())
