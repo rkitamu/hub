@@ -83,7 +83,12 @@ class FakeBackend(hub_backend.Backend):
         return self.places.pop(label, None) is not None
 
 
-class HubWorkTest(unittest.TestCase):
+class WorkEnv(unittest.TestCase):
+    """一時ディレクトリに環境と app リポジトリを作り、hub-work を backend を差し替えて呼べるようにする。"""
+
+    def make_backend(self):
+        return FakeBackend(self.env, {})
+
     def setUp(self):
         tmp = tempfile.TemporaryDirectory()
         self.addCleanup(tmp.cleanup)
@@ -107,7 +112,7 @@ class HubWorkTest(unittest.TestCase):
         self.git("init", "-q", "-b", "main")
         self.git("commit", "-q", "--allow-empty", "-m", "init")
         self.hw = load_hub_work()
-        self.backend = FakeBackend(self.env, {})
+        self.backend = self.make_backend()
         self.hw.backend_for = lambda env, cfg: self.backend
         self.wd = self.env / "hub-env/work"
 
@@ -121,6 +126,9 @@ class HubWorkTest(unittest.TestCase):
             rc = self.hw.main()
         return rc, out.getvalue(), err.getvalue()
 
+
+
+class HubWorkTest(WorkEnv):
     def calls(self, kind):
         return [c for c in self.backend.calls if c[0] == kind]
 
@@ -255,6 +263,37 @@ class HubWorkTest(unittest.TestCase):
         _, out, _ = self.run_cmd("list")
         self.assertIn("w-ls=停止", out)
 
+
+class NoBackendTest(WorkEnv):
+    """backend なし（none）では、worktree と status.md を作り、起動コマンドを示す。"""
+
+    def make_backend(self):
+        return hub_backend.NoneBackend(self.env, {})
+
+    def test_start_shows_launch_command_with_brief(self):
+        rc, out, err = self.run_cmd("start", "nb", "--repo", "app", "--worktree", "--request", "依頼-固有")
+        self.assertEqual(rc, 0, err)
+        tree = self.env / ".hub-worktrees/nb/app"
+        self.assertTrue(tree.is_dir())
+        brief = self.wd / "nb/brief.md"
+        self.assertIn("依頼-固有", brief.read_text())
+        self.assertIn(f"cd {tree} && claude --allowedTools", out)
+        self.assertIn(f'"$(cat {brief})"', out)
+        self.assertFalse((self.wd / "nb/undelivered-brief.md").exists())
+
+    def test_start_without_request(self):
+        rc, out, _ = self.run_cmd("start", "nr", "--repo", "app")
+        self.assertEqual(rc, 0)
+        self.assertNotIn("$(cat", out)
+        self.assertFalse((self.wd / "nr/brief.md").exists())
+
+    def test_list_and_finish(self):
+        self.run_cmd("start", "nf", "--repo", "app", "--worktree")
+        _, out, _ = self.run_cmd("list")
+        self.assertIn("w-nf=不明", out)
+        rc, _, err = self.run_cmd("finish", "nf")
+        self.assertEqual(rc, 0, err)
+        self.assertFalse((self.env / ".hub-worktrees/nf").exists())
 
 if __name__ == "__main__":
     unittest.main()

@@ -1,0 +1,149 @@
+#!/usr/bin/env -S uv run --quiet --script
+# /// script
+# requires-python = ">=3.11"
+# dependencies = []
+# ///
+"""旧形式の hub.toml を新形式（[[agent]] と [herdr]）に書き換える。
+
+usage:
+  migrate-hub-toml <hub.toml>           新形式を標準出力に出す（ファイルは変えない）
+  migrate-hub-toml <hub.toml> --write   <hub.toml>.bak を残して書き換える
+
+- ペインの agent = { name, args, kind } は [[agent]] に移し、ペインには agent = "<name>" を残す
+- setup のワークスペースの agents は、[[agent]] に launched_by = "setup" で足す
+- 司令塔の名前 hub は commander に改める
+- コメントは引き継がない
+"""
+
+from __future__ import annotations
+
+import json
+import sys
+import tomllib
+from pathlib import Path
+
+LEGACY_COMMANDER = "hub"
+COMMANDER = "commander"
+TOP_KEYS = ("session", "todo_file", "workspace")
+WS_KEYS = ("label", "cwd", "setup", "agents", "tab")
+TAB_KEYS = ("label", "pane")
+PANE_KEYS = ("name", "split", "cwd", "run", "agent")
+
+HEADER = """\
+# 環境の構成。パスはすべて環境（hub-env の親ディレクトリ）からの相対パスで書く。
+# migrate-hub-toml が旧形式から書き換えた。書き方は hub の templates/hub.toml にある。
+"""
+
+
+class MigrateError(Exception):
+    pass
+
+
+def value(v) -> str:
+    """TOML の値を書く。hub.toml に出てくる型（文字列・数・真偽・配列・インラインの表）だけを扱う。"""
+    if isinstance(v, bool):
+        return "true" if v else "false"
+    if isinstance(v, (int, float)):
+        return repr(v)
+    if isinstance(v, str):
+        return json.dumps(v, ensure_ascii=False)
+    if isinstance(v, list):
+        return "[" + ", ".join(value(x) for x in v) + "]"
+    if isinstance(v, dict):
+        return "{ " + ", ".join(f"{k} = {value(x)}" for k, x in v.items()) + " }"
+    raise MigrateError(f"書けない値です: {v!r}")
+
+
+def renamed(name: str) -> str:
+    return COMMANDER if name == LEGACY_COMMANDER else name
+
+
+def check_keys(where: str, table: dict, known: tuple[str, ...]) -> None:
+    unknown = sorted(set(table) - set(known))
+    if unknown:
+        raise MigrateError(f"{where}: 知らないキーがあるので書き換えられません: {', '.join(unknown)}")
+
+
+def migrate(cfg: dict) -> str:
+    if "agent" in cfg or "herdr" in cfg or "backend" in cfg:
+        raise MigrateError("既に新形式です")
+    check_keys("hub.toml", cfg, TOP_KEYS)
+    agents: list[dict] = []
+    names: set[str] = set()
+
+    def add(agent: dict) -> None:
+        if agent["name"] in names:
+            raise MigrateError(f"エージェント {agent['name']} が 2 か所で定義されています")
+        names.add(agent["name"])
+        agents.append(agent)
+
+    lines = [HEADER, 'backend = "herdr"']
+    if "todo_file" in cfg:
+        lines.append(f"todo_file = {value(cfg['todo_file'])}")
+    layout: list[str] = ["", "# ── herdr のレイアウト（herdr-reset が読む） ──", "[herdr]"]
+    if "session" in cfg:
+        layout.append(f"session = {value(cfg['session'])}")
+    for ws in cfg.get("workspace", []):
+        label = ws.get("label")
+        check_keys(f"ワークスペース {label}", ws, WS_KEYS)
+        layout += ["", "[[herdr.workspace]]"]
+        for key in ("label", "cwd", "setup"):
+            if key in ws:
+                layout.append(f"{key} = {value(ws[key])}")
+        if "agents" in ws:
+            setup_agents = [renamed(n) for n in ws["agents"]]
+            for n in setup_agents:
+                add({"name": n, "cwd": ws.get("cwd", ""), "launched_by": "setup"})
+            layout.append(f"agents = {value(setup_agents)}")
+        for tab in ws.get("tab", []):
+            check_keys(f"ワークスペース {label} のタブ", tab, TAB_KEYS)
+            layout += ["", "[[herdr.workspace.tab]]", f"label = {value(tab.get('label'))}"]
+            for pane in tab.get("pane", []):
+                check_keys(f"ワークスペース {label} のペイン", pane, PANE_KEYS)
+                layout += ["", "[[herdr.workspace.tab.pane]]"]
+                for key in ("name", "split", "cwd", "run"):
+                    if key in pane:
+                        layout.append(f"{key} = {value(pane[key])}")
+                if ag := pane.get("agent"):
+                    check_keys(f"ワークスペース {label} のペインの agent", ag, ("name", "args", "kind"))
+                    agent = {"name": renamed(ag["name"]), "cwd": pane.get("cwd") or ws.get("cwd", "")}
+                    if ag.get("args"):
+                        agent["args"] = ag["args"]
+                    if ag.get("kind", "claude") != "claude":
+                        agent["kind"] = ag["kind"]
+                    add(agent)
+                    layout.append(f"agent = {value(agent['name'])}")
+
+    out = lines + ["", "# ── エージェント（backend によらない） ──"]
+    for agent in agents:
+        out += ["", "[[agent]]"] + [f"{k} = {value(v)}" for k, v in agent.items()]
+    return "\n".join(out + layout) + "\n"
+
+
+def main() -> int:
+    args = sys.argv[1:]
+    if not args or args[0] in ("-h", "--help") or len(args) > 2 or (len(args) == 2 and args[1] != "--write"):
+        print(__doc__.strip(), file=sys.stderr if args[:1] not in (["-h"], ["--help"]) else sys.stdout)
+        return 0 if args[:1] in (["-h"], ["--help"]) else 2
+    path = Path(args[0])
+    try:
+        text = migrate(tomllib.loads(path.read_text()))
+        tomllib.loads(text)  # 書いたものが読めることを確かめる
+    except (OSError, tomllib.TOMLDecodeError, MigrateError) as e:
+        print(f"error: {e}", file=sys.stderr)
+        return 1
+    if len(args) == 1:
+        sys.stdout.write(text)
+        return 0
+    backup = path.with_name(path.name + ".bak")
+    if backup.exists():
+        print(f"error: {backup} が既にあります。不要なら消してから実行してください", file=sys.stderr)
+        return 1
+    backup.write_bytes(path.read_bytes())
+    path.write_text(text)
+    print(f"書き換えました: {path}（元のファイル: {backup}）")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

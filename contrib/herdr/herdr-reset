@@ -3,22 +3,24 @@
 # requires-python = ">=3.11"
 # dependencies = []
 # ///
-"""hub.toml の通りに、herdr の環境を組み立て直す。
+"""hub.toml の [herdr] の通りに、herdr の環境を組み立て直す（旧形式の hub.toml では [[workspace]]）。
 
 usage:
   herdr-reset            ワークスペースを全部閉じて、hub.toml の順に作り直す
   herdr-reset <label>…   指定したワークスペースだけを作り直す
   herdr-reset [<label>…] --handoff "<引き継ぎ文>"
-                       立て直したあと、新しい hub エージェントへ引き継ぎ文を送る
+                       立て直したあと、新しい司令塔へ引き継ぎ文を送る
   herdr-reset [<label>…] --resume
-                       hub エージェントだけ同じセッションで起動し直す。他のエージェントは新規に起動する
+                       司令塔だけ同じセッションで起動し直す。他のエージェントは新規に起動する
 
 --resume は同じ会話の続きなので、新しい rules は適用されない。記録された ID か履歴が無ければ、何も閉じずに止まる。--handoff とは同時に指定できない。
---handoff の値は - で始まっていても、空白や改行を含んでいてもよい。hub が立て直す対象に無ければ、何も閉じずに止まる。
+--handoff の値は - で始まっていても、空白や改行を含んでいてもよい。司令塔が立て直す対象に無ければ、何も閉じずに止まる。
 引き継ぎ文は、届くまで環境の state ディレクトリの handoff.md（権限 600）に残る。秘密情報は書かない。
 未配送の handoff.md があるときは上書きせずに止まる。届いていないことを確かめて送り直すか、不要なら消す。
 
-herdr のペインの中で実行する。環境は、HERDR_SESSION を session に書いた ~/.config/hub/envs の環境。
+司令塔は、新形式の hub.toml では [[agent]] の commander、旧形式では hub。
+herdr のペインの中で実行する。環境は、HERDR_SESSION を [herdr] の session（旧形式では session）に書いた ~/.config/hub/envs の環境。
+自動では実行されない。OS の再起動などで herdr がレイアウトだけを戻したときも、手で実行する。
 """
 
 from __future__ import annotations
@@ -37,6 +39,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent.parent / "lib"))
 from hub_backend import load_module  # noqa: E402
 from hublib import HubError as ResetError  # noqa: E402
+from hub_config import LEGACY_COMMANDER, commander_name, session_record_name  # noqa: E402
 from hublib import agent_argv, claude_launch_args, commander_launch, commander_resume_args, env_state_dir, find_env  # noqa: E402
 
 # NOTE: herdr-reset は herdr のレイアウトそのものを組み立てるので、backend の操作ではなく herdr を直接呼ぶ。
@@ -45,7 +48,7 @@ HerdrError, herdr, workspaces = _herdr.HerdrError, _herdr.herdr, _herdr.workspac
 
 LOG = Path(os.environ.get("XDG_STATE_HOME") or Path.home() / ".local/state") / "herdr-reset.log"
 PLACEHOLDER = "herdr-reset-tmp"
-HUB_AGENT = "hub"
+HUB_AGENT = "hub"  # main() で決める。司令塔の名前（新形式の hub.toml では commander）
 # NOTE: 1 つの引数の上限（128KiB）を、前置きを足しても超えないようにする。
 HANDOFF_MAX_BYTES = 100_000
 # 信頼確認などにユーザーが答えられるよう待つ秒数。テストでは環境変数 HERDR_RESET_HANDOFF_WAIT で短くする。
@@ -460,15 +463,15 @@ def deliver_handoff(path: Path, old_terminal: str | None) -> bool:
             result = send_handoff(body)
             if result == "ok":
                 path.unlink(missing_ok=True)
-                print("引き継ぎを hub へ届けました", flush=True)
+                print(f"引き継ぎを {HUB_AGENT} へ届けました", flush=True)
                 return True
             if result == "timeout":
                 # 届いた可能性があるので、画面で確かめる。長い文は省略表示されうるので、見えなくても再送しない
                 if seen_on_screen(marker):
                     path.unlink(missing_ok=True)
-                    print("引き継ぎが hub の画面に届いていることを確かめました", flush=True)
+                    print(f"引き継ぎが {HUB_AGENT} の画面に届いていることを確かめました", flush=True)
                     return True
-                return give_up("送信が timeout し、届いたか確かめられないので再送しません。hub の画面を確認してください")
+                return give_up(f"送信が timeout し、届いたか確かめられないので再送しません。{HUB_AGENT} の画面を確認してください")
             if result != "blocked":
                 return give_up(result)
             status = "blocked"
@@ -551,7 +554,7 @@ def parse_args(argv: list[str]) -> tuple[list[str], str | None, bool, bool, str 
 
 
 def main() -> int:
-    global ENV_DIR, LAUNCH, HUB_LAUNCH, RESUME_ARGS
+    global ENV_DIR, LAUNCH, HUB_LAUNCH, RESUME_ARGS, HUB_AGENT
     labels, text, resume, show_help, arg_error = parse_args(sys.argv[1:])
     if show_help:
         print(__doc__.strip())
@@ -565,8 +568,11 @@ def main() -> int:
         bad = [a for a in labels if a.startswith("-")]
         if bad:
             raise ResetError(f"知らないオプションです: {bad[0]}")
-        ENV_DIR, cfg = find_env()
-        _herdr.create(ENV_DIR, cfg).check()  # 環境が cwd や HUB_ENV から決まっても、別のセッションは操作しない
+        ENV_DIR, raw = find_env()
+        HUB_AGENT = commander_name(raw)
+        # NOTE: 新形式の hub.toml も、旧形式の [[workspace]] の形に揃えてから組み立てる。
+        cfg = {"workspace": _herdr.layout(ENV_DIR, raw)}
+        _herdr.create(ENV_DIR, raw).check()  # 環境が cwd や HUB_ENV から決まっても、別のセッションは操作しない
         handoff_path = env_state_dir(ENV_DIR) / "handoff.md"
         if resumed:
             if not handoff_path.is_file():
@@ -585,11 +591,15 @@ def main() -> int:
             raise ResetError(f"hub.toml に無いワークスペースです: {', '.join(unknown)}")
 
         state = env_state_dir(ENV_DIR)
+        record = state / session_record_name(raw)
         pane = hub_pane(cfg, labels)
         if resume:
-            RESUME_ARGS = resume_args(pane, state / "hub-session.json")
+            # NOTE: 移行期間は、新形式に書き換える前の記録（hub-session.json）からも再開できるようにする。
+            legacy_record = state / f"{LEGACY_COMMANDER}-session.json"
+            from_record = record if record.exists() or not legacy_record.exists() else legacy_record
+            RESUME_ARGS = resume_args(pane, from_record)
         if pane:
-            HUB_LAUNCH = commander_launch(ENV_DIR, pane["agent"], pane["_cwd"], LAUNCH, state / "hub-session.json")
+            HUB_LAUNCH = commander_launch(ENV_DIR, pane["agent"], pane["_cwd"], LAUNCH, record)
 
         if text is not None or resumed or resume:
             if not hub_is_target(cfg, labels):
