@@ -9,6 +9,8 @@ from pathlib import Path
 from unittest import mock
 
 HUB = Path(__file__).resolve().parent.parent
+# NOTE: hub の中に __pycache__ を作らない（install.sh のリンクの対象に紛れ込むため）。
+sys.dont_write_bytecode = True
 sys.path.insert(0, str(HUB / "lib"))
 import hub_backend  # noqa: E402
 import hublib  # noqa: E402
