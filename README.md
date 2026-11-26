@@ -138,7 +138,7 @@ worktrees: []
 - `--repo` には hub-env（`--worktree` と `--request` が必須）と、環境の外のリポジトリ（例: `../src/hub`）も指定できる。
 - 元のリポジトリが信頼済みなら、`--worktree` の worktree も Claude Code の信頼済みフォルダとして扱う。依頼が届かなかったときは、再送のコマンドを表示する。
 - `--worktree` を付けると、`<環境>/.hub-worktrees/<作業名>/<repo>` にブランチ `work/<作業名>` の worktree を作る。herdr では worktree 1 つが 1 ワークスペースなので、複数リポジトリでは 2 つ目以降が `w-<作業名>--<repo>` になる。
-- `finish` は worktree に未コミットの変更があれば、何も閉じずに止まる。ブランチは消さない。`.gitignore` された未追跡ファイルは未コミットの変更に数えず、worktree と一緒に消える。
+- `finish` は worktree に未コミットの変更があれば、何も閉じずに止まる。worktree を外したあと、作業ブランチ `work/<作業名>` がマージ済みならローカルから消す（`git branch -d`）。マージ先は、origin があれば origin の既定ブランチ、無ければローカルの main。マージされていないときや判定できないときは残し、その旨を表示する。リモートのブランチは消さない。`.gitignore` された未追跡ファイルは未コミットの変更に数えず、worktree と一緒に消える。
 - herdr では、作業のワークスペースが他の worktree の親になっているときも、他の作業を巻き込まないよう止まる。
 - 作業エージェントは、`status.md` に書いてから `hub-agent notify` で司令塔へ知らせる。
 - `archive` は作業名に使えない。`archive/` にある名前も再利用できない。

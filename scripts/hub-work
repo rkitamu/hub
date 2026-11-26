@@ -18,9 +18,11 @@ usage:
 from __future__ import annotations
 
 import argparse
+import os
 import re
 import shlex
 import shutil
+import subprocess
 import sys
 import time
 from pathlib import Path
@@ -338,6 +340,72 @@ def cmd_resume(a: argparse.Namespace, backend: Backend, env: Path, wd: Path) -> 
     return 1 if undelivered else 0
 
 
+def net_git(repo: Path, *args: str) -> subprocess.CompletedProcess:
+    """origin と通信する git。認証を尋ねて止まらないようにし、時間で打ち切る。"""
+    try:
+        return subprocess.run(["git", "-C", str(repo), *args], capture_output=True, text=True, timeout=60,
+                              stdin=subprocess.DEVNULL, env={**os.environ, "GIT_TERMINAL_PROMPT": "0"})
+    except subprocess.TimeoutExpired:
+        return subprocess.CompletedProcess(args, 124, "", "timeout")
+
+
+def merge_base_ref(repo: Path) -> str:
+    """作業ブランチがマージされる先。origin があれば fetch した origin の既定ブランチ、無ければローカルの main / master。"""
+    if git(repo, "remote", "get-url", "origin", check=False).returncode != 0:
+        for b in ("main", "master"):
+            if git(repo, "rev-parse", "--verify", "-q", f"refs/heads/{b}", check=False).returncode == 0:
+                return b
+        raise HubError("origin が無く、ローカルに main も master もありません")
+    if net_git(repo, "fetch", "--prune", "-q", "origin").returncode != 0:
+        raise HubError("origin を fetch できませんでした")
+    p = git(repo, "symbolic-ref", "--short", "refs/remotes/origin/HEAD", check=False)
+    if p.returncode == 0:
+        return p.stdout.strip()
+    m = re.search(r"^ref: refs/heads/(\S+)\tHEAD$", net_git(repo, "ls-remote", "--symref", "origin", "HEAD").stdout, re.M)
+    if m and git(repo, "rev-parse", "--verify", "-q", f"refs/remotes/origin/{m[1]}", check=False).returncode == 0:
+        return f"origin/{m[1]}"
+    raise HubError("origin の既定ブランチが分かりません")
+
+
+def merged_pr(repo: Path, branch: str) -> str | None:
+    """GitHub の PR が MERGED なら番号を返す。gh が使えないときや、分からないときは None。"""
+    if "github.com" not in git(repo, "remote", "get-url", "origin", check=False).stdout or not shutil.which("gh"):
+        return None
+    try:
+        p = subprocess.run(["gh", "pr", "list", "--head", branch, "--state", "merged", "--json", "number", "--jq", ".[0].number"],
+                           cwd=repo, capture_output=True, text=True, timeout=30)
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    return (p.stdout.strip() or None) if p.returncode == 0 else None
+
+
+def tidy_branch(repo: Path, branch: str, name: str) -> str:
+    """マージ済みの作業ブランチを git branch -d で消す。消さないときは、その理由を返す。リモートのブランチには触らない。"""
+    if branch != f"work/{name}":
+        return f"ブランチ {branch} は作業ブランチの名前ではないので残しています"
+    if git(repo, "rev-parse", "--verify", "-q", f"refs/heads/{branch}", check=False).returncode != 0:
+        return f"ブランチ {branch} はもうありません"
+    base = merge_base_ref(repo)
+    if git(repo, "merge-base", "--is-ancestor", branch, base, check=False).returncode != 0:
+        if pr := merged_pr(repo, branch):
+            return (f"ブランチ {branch} は、PR #{pr} がマージ済みですが、履歴が {base} に含まれない（squash merge など）ので"
+                    "残しています。不要なら手で消してください")
+        return f"ブランチ {branch} は {base} にマージされていないので残しています"
+    # NOTE: git branch -d は upstream（無ければ HEAD）に含まれるかで確かめる。元のリポジトリの HEAD が
+    # 古い main でも消せるよう、確かめる先を判定に使った base に向けてから -d する。失敗したら元へ戻す。
+    keys = [f"branch.{branch}.remote", f"branch.{branch}.merge"]
+    saved = {k: git(repo, "config", "--get", k, check=False).stdout.strip() for k in keys}
+    git(repo, "branch", f"--set-upstream-to={base}", branch)
+    p = git(repo, "branch", "-d", branch, check=False)
+    if p.returncode == 0:
+        return f"ブランチ {branch} を消しました（{base} にマージ済み）"
+    for k, v in saved.items():
+        git(repo, "config", "--unset", k, check=False)
+        if v:
+            git(repo, "config", k, v)
+    return f"ブランチ {branch} は git branch -d で消せなかったので残しています: {p.stderr.strip()}"
+
+
 def cmd_finish(a: argparse.Namespace, backend: Backend, env: Path, wd: Path) -> int:
     path = status_path(wd, a.name)
     meta, body = read_status(path)
@@ -363,7 +431,11 @@ def cmd_finish(a: argparse.Namespace, backend: Backend, env: Path, wd: Path) -> 
         backend.close_place(wt["workspace"], wt)
         if tree.exists():
             git((env / wt["repo"]).resolve(), "worktree", "remove", str(tree))
-        print(f"worktree を外しました: {tree}（ブランチ {wt['branch']} は残しています）")
+        print(f"worktree を外しました: {tree}")
+        try:
+            print(tidy_branch((env / wt["repo"]).resolve(), wt["branch"], a.name))
+        except HubError as e:
+            print(f"ブランチ {wt['branch']} は、マージ済みか判定できないので残しています: {e}")
         if wt.get("trusted"):
             try:
                 untrust_worktree(tree.resolve())
