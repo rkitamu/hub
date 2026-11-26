@@ -3,7 +3,7 @@
 
 usage: hub-session-record --state <記録先> --cwd <hub エージェントの cwd>
 
-hub-reset が hub エージェントにだけ渡す設定から呼ばれる。入力が SessionStart で、cwd が一致し、
+herdr-reset が hub エージェントにだけ渡す設定から呼ばれる。入力が SessionStart で、cwd が一致し、
 セッション ID と履歴のパスが正しいときだけ、記録を原子的に置き換える（権限 600）。
 記録の失敗でセッションの起動を妨げないよう、常に exit 0 で終わる。
 """

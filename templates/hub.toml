@@ -1,7 +1,7 @@
-# 環境の herdr の構成。hub-reset はこの通りに herdr を組み立てる。
+# 環境の herdr の構成。herdr-reset はこの通りに herdr を組み立てる。
 # パスはすべて環境（hub-env の親ディレクトリ）からの相対パスで書く。
 
-# 環境を置く herdr のセッション名。hub-reset はこのセッションのペインで実行する。
+# 環境を置く herdr のセッション名。herdr-reset はこのセッションのペインで実行する。
 session = "hub"
 
 # hub-status が期限を読む TODO のファイル。既定は todo/data/active.md。
@@ -9,11 +9,11 @@ session = "hub"
 
 # ── ワークスペース ──────────────────────────────────────────────
 # [[workspace]] を書いた順に、herdr のサイドバーへ並ぶ。
-#   label  ワークスペースの名前。hub-reset <label> で、そのワークスペースだけを作り直せる
+#   label  ワークスペースの名前。herdr-reset <label> で、そのワークスペースだけを作り直せる
 #   cwd    ワークスペースのディレクトリ。ペインは、ペインの cwd を書かなければここで開く
 #   setup  タブとペインの定義の代わりに、このスクリプトで組み立てる（環境からの相対パス。tab とは同時に書けない）
 #          スクリプトは cwd で実行され、label と同じ名前のワークスペースを作る。環境変数 HUB_ENV_DIR・HUB_WORKSPACE_LABEL が渡る
-#          hub-reset は、既存のワークスペースを閉じてから実行する
+#          herdr-reset は、既存のワークスペースを閉じてから実行する
 #          スクリプトが起動するエージェントに rules を渡すには、環境変数 HUB_CLAUDE_ARGS（シェル用に引用済み）を claude の引数に足す
 #   agents setup が起動するエージェントの名前の一覧（省略可）。hub-check の照合に使う
 #

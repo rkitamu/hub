@@ -18,9 +18,9 @@
 
 | 名前 | herdr の場所 | 起動 | できること |
 |---|---|---|---|
-| `hub` | ワークスペース `hub-env` / タブ `Claude`（cwd は `hub-env`） | `hub-reset` | 地図をもとに全体の質問に答える、他のエージェントへの指示、横断的な改善 |
+| `hub` | ワークスペース `hub-env` / タブ `Claude`（cwd は `hub-env`） | `herdr-reset` | 地図をもとに全体の質問に答える、他のエージェントへの指示、横断的な改善 |
 <!-- 例（hub.toml のコメントにある todo ワークスペースの例に対応）。hub.toml に agent を書いたら、ここにも 1 行足す:
-| `todo` | ワークスペース `todo` / タブ `ToDo` の右ペイン | `hub-reset todo`（`claude --agent todo`） | TODO の追加・更新・完了、今日やることのピック。作業そのものはしない |
+| `todo` | ワークスペース `todo` / タブ `ToDo` の右ペイン | `herdr-reset todo`（`claude --agent todo`） | TODO の追加・更新・完了、今日やることのピック。作業そのものはしない |
 -->
 
 - これらは herdr のセッション `<hub.toml の session>` に置く。

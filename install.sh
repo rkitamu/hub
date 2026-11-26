@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-#   ./install.sh               scripts/ のコマンドを ~/.local/bin にリンクする
+#   ./install.sh               scripts/ と contrib/*/ のコマンドを ~/.local/bin にリンクする
 #   ./install.sh --env <dir>   上に加えて、<dir> に hub-env を雛形から作り（既にあるファイルはそのまま）、~/.config/hub/envs に登録する
 #   ./install.sh --uninstall   ~/.local/bin のリンクを外す
 set -euo pipefail
@@ -23,7 +23,16 @@ esac
 # ── コマンド ────────────────────────────────────────────────────
 echo "== hub: コマンド"
 mkdir -p "$DEST"
-for f in "$HUB"/scripts/*; do
+# 実行できるファイルだけ（backend.py などのモジュールや __pycache__ は除く）
+commands=()
+for f in "$HUB"/scripts/* "$HUB"/contrib/*/*; do
+  [[ -f "$f" && -x "$f" && "$f" != *.py ]] && commands+=("$f")
+done
+# hub の中を指したまま先が無くなったリンク（改名や移動の前のコマンド）を外す
+for link in "$DEST"/*; do
+  [[ -L "$link" && ! -e "$link" && "$(readlink "$link")" == "$HUB/"* ]] && rm "$link" && echo "removed  $link（リンク先がありません）"
+done
+for f in "${commands[@]}"; do
   link="$DEST/$(basename "$f")"
   if [[ "$mode" == "uninstall" ]]; then
     [[ "$(readlink "$link")" == "$f" ]] && rm "$link" && echo "removed  $link"
@@ -58,7 +67,7 @@ sed -e "s|{{ENV_NAME}}|$(basename "$env_dir")|g" "$HUB/templates/README.md" | cr
 create MAP.md <"$HUB/templates/MAP.md"
 create hub.toml <"$HUB/templates/hub.toml"
 create .claude/skills/delegate/SKILL.md <"$HUB/templates/skills/delegate/SKILL.md"
-# hub-reset と hub-work が起動するエージェントに --settings で渡す
+# herdr-reset と hub-work が起動するエージェントに --settings で渡す
 sed -e "s|{{HUB_ENV}}|$HUB_ENV|g" -e "s|{{HUB}}|$HUB|g" "$HUB/templates/agent-settings.json" | create agent-settings.json
 # 作業文書（work/）は hub-env の git に入れない。手元専用の別リポジトリにする
 printf '/work/\n' | create .gitignore
