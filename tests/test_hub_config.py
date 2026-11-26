@@ -152,6 +152,17 @@ class LayoutTest(unittest.TestCase):
                 self.layout(text)
 
 
+class TemplateTest(unittest.TestCase):
+    def test_template_is_new_format(self):
+        cfg = tomllib.loads((HUB / "templates/hub.toml").read_text())
+        env = Path("/env")
+        self.assertFalse(hub_config.is_legacy(cfg))
+        self.assertEqual([a["name"] for a in hub_config.agent_defs(env, cfg)], ["commander"])
+        pane = herdr_backend.layout(env, cfg)[0]["tab"][0]["pane"][0]
+        self.assertEqual(pane["agent"]["name"], "commander")
+        self.assertEqual(hub_backend.backend_name(cfg), "herdr")
+
+
 class MigrateTest(unittest.TestCase):
     env = Path("/env")
 

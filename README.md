@@ -1,6 +1,6 @@
 # hub
 
-hub は、1 つのディレクトリに並ぶリポジトリを、herdr の上でまとめて扱うための道具。このディレクトリを「環境」と呼ぶ。
+hub は、1 つのディレクトリに並ぶリポジトリを、Claude のエージェントでまとめて扱うための道具。このディレクトリを「環境」と呼ぶ。エージェントを置いて動かす仕組み（backend）には、herdr を使える（`contrib/herdr`）。
 
 環境ごとに `hub-env` というディレクトリを作り、そこで開いた Claude が、地図 `MAP.md` を読んで環境全体の司令塔になる。hub 自体はどこに clone してもよく、1 つを全部の環境で共有する。
 
@@ -18,7 +18,8 @@ hub は、1 つのディレクトリに並ぶリポジトリを、herdr の上�
 ## 前提
 
 - `~/.local/bin` に PATH が通っている
-- herdr・[uv](https://docs.astral.sh/uv/) が入っている
+- [uv](https://docs.astral.sh/uv/) が入っている
+- backend に herdr を使うなら、herdr が入っている
 
 ## セットアップ
 
@@ -32,13 +33,15 @@ git -C ~/src/hub config core.hooksPath .githooks   # hub の main / master へ�
 
 次のコマンドが `~/.local/bin` にリンクされる。
 
-- `herdr-reset`
 - `hub-work`
+- `hub-agent`
 - `hub-status`
 - `hub-check`
 - `hub-guard`
 - `hub-commit-guard`
 - `hub-session-record`
+- `herdr-reset`（`contrib/herdr`）
+- `migrate-hub-toml`（`contrib/herdr`）
 
 ### 2. 環境を用意する
 
@@ -52,18 +55,20 @@ git clone <todo> todo   # 子リポジトリの例
 
 ### 3. `hub-env/hub.toml` と `hub-env/MAP.md` を編集する
 
-雛形には、司令塔の `hub-env` ワークスペースだけが有効な最小構成で入っている。そのままでも `herdr-reset` で動く。
+`hub.toml` には、エージェントの定義（`[[agent]]`）と、backend の設定（herdr なら `[herdr]` のレイアウト）を書く。雛形には、司令塔 `commander` と、その `hub-env` ワークスペースだけが有効な最小構成で入っている。書き方は雛形のコメントにある。
 
 `todo` ワークスペース・`todo` エージェント・`scripts/todo-view` などは、作者の手元の todo リポジトリを前提にした例で、コメントアウトしてある。自分の子リポジトリに合わせて書き換えるか、消す。
 
-### 4. herdr を開いて `herdr-reset` を実行する
+### 4. 司令塔を起動する
+
+backend が herdr なら、herdr を開いて `herdr-reset` を実行する。セッション名は `hub.toml` の `[herdr]` の `session` に書いたもの。
 
 ```sh
 herdr --session <セッション名>
 herdr-reset
 ```
 
-セッション名は `hub.toml` の `session` に書いたもの。
+backend を使わない（`backend = "none"`）なら、端末で `hub-agent launch commander` を実行する。
 
 ## hub-env
 
@@ -73,7 +78,7 @@ herdr-reset
 |---|---|
 | `CLAUDE.md` | hub の `commander.md`（司令塔の共通ルール）と `MAP.md` を読み込む |
 | `MAP.md` | 地図。子リポジトリとエージェント、子同士の連携ルール |
-| `hub.toml` | herdr のセッション名と、ワークスペース・タブ・ペインの構成。書き方は雛形のコメントにある |
+| `hub.toml` | backend、エージェントの定義（`[[agent]]`）、herdr のセッション名とワークスペース・タブ・ペインの構成（`[herdr]`）。書き方は雛形のコメントにある |
 | `README.md` | この環境の司令塔への頼み方の表 |
 | `.claude/settings.local.json` | 司令塔の Claude Code の設定。環境と hub を読む許可と、`hub-guard` フック |
 | `.claude/skills/delegate/` | TODO の作業を任せる段取りのスキル |
@@ -87,31 +92,22 @@ herdr-reset
 ## コマンド
 
 ```sh
-herdr-reset         # ワークスペースを全部閉じて、hub.toml の通りに作り直す
-herdr-reset todo    # todo ワークスペース（hub.toml の label）だけを作り直す
-herdr-reset [<label>...] --handoff "<引き継ぎ文>"   # 立て直したあと、新しい hub エージェントへ引き継ぐ
-herdr-reset [<label>...] --resume   # セッションを復帰して立て直す
-
 hub-work start <作業名> --repo <repo> [--todo <id>] [--worktree] [--purpose <目的>] [--request <依頼文>]
 hub-work finish <作業名>   # 記録されたものだけを閉じ、archive へ移す
 hub-work resume <作業名>   # herdr-reset の後などに、status.md から立て直す
 hub-work list [--all]
 
+hub-agent list                       # 動いているエージェントと状態
+hub-agent send <名前> "<依頼>"        # エージェントに送る
+hub-agent read <名前> [--lines <N>]   # エージェントの画面を読む
+hub-agent notify "<作業名と要約>"     # 司令塔へ通知する（作業エージェントが使う）
+hub-agent launch <名前> [--print]     # [[agent]] の通りに、この端末で起動する
+
 hub-status [--days 7]      # エージェント・未コミット・進行中の作業・期限の近い TODO
 hub-check                  # MAP.md・hub.toml・リポジトリ・エージェントのずれを検査（ずれがあれば exit 1）
 ```
 
-`hub.toml` の `session` に書いたセッションのペインで実行する。
-
-### 引き継ぎ（herdr-reset --handoff）
-
-`herdr-reset --handoff "<引き継ぎ文>"` で、立て直したあとの司令塔へ作業を引き継げる。
-
-```sh
-herdr-reset --handoff "目的: ...
-現状: ...
-次の手順: ..."
-```
+環境の中で実行する。herdr なら、`[herdr]` の `session` に書いたセッションのペインでも実行できる。環境変数 `HUB_ENV` に環境のパスを指定してもよい。
 
 ### 作業（hub-work）
 
@@ -141,15 +137,57 @@ worktrees: []
 - `state` は `active` / `blocked` / `done`。front matter の値は JSON で書く（YAML としても読める）。
 - `--repo` には hub-env（`--worktree` と `--request` が必須）と、環境の外のリポジトリ（例: `../src/hub`）も指定できる。
 - 元のリポジトリが信頼済みなら、`--worktree` の worktree も Claude Code の信頼済みフォルダとして扱う。依頼が届かなかったときは、再送のコマンドを表示する。
-- `--worktree` を付けると、`<環境>/.hub-worktrees/<作業名>/<repo>` にブランチ `work/<作業名>` の worktree を作る。herdr の worktree は 1 つが 1 ワークスペースなので、複数リポジトリでは 2 つ目以降が `w-<作業名>--<repo>` になる。
+- `--worktree` を付けると、`<環境>/.hub-worktrees/<作業名>/<repo>` にブランチ `work/<作業名>` の worktree を作る。herdr では worktree 1 つが 1 ワークスペースなので、複数リポジトリでは 2 つ目以降が `w-<作業名>--<repo>` になる。
 - `finish` は worktree に未コミットの変更があれば、何も閉じずに止まる。ブランチは消さない。`.gitignore` された未追跡ファイルは未コミットの変更に数えず、worktree と一緒に消える。
-- 作業のワークスペースが他の worktree の親になっているときも、他の作業を巻き込まないよう止まる。
+- herdr では、作業のワークスペースが他の worktree の親になっているときも、他の作業を巻き込まないよう止まる。
+- 作業エージェントは、`status.md` に書いてから `hub-agent notify` で司令塔へ知らせる。
 - `archive` は作業名に使えない。`archive/` にある名前も再利用できない。
+
+### rules と agent-settings.json
+
+`hub-work`・`hub-agent launch`・`herdr-reset` が起動する claude に、次を渡す。agent の `args` とは併用できる（`--settings` と `--append-system-prompt-file` を `args` に書くと衝突として止まる）。
+
+- `--append-system-prompt-file`: `<hub-env>/rules/*.md` を連結した生成ファイル（rules が無ければ渡さない）。`$XDG_STATE_HOME/hub/envs/<環境>-<ハッシュ>/agent-rules.md` に置く
+- `--settings`: `<hub-env>/agent-settings.json`（あれば）
+
+反映されるのは、次に起動したエージェントから。`setup` のスクリプトが自分で起動するエージェントには自動では届かないので、スクリプト側で環境変数 `HUB_CLAUDE_ARGS`（シェル用に引用済み）を claude の引数に足す。
+
+### backend なし（backend = "none"）
+
+`hub-work start` は worktree と `status.md` を作り、エージェントは起動せずに、起動コマンドを表示する。依頼文は作業ディレクトリの `brief.md` に置かれ、表示されたコマンドが最初のプロンプトとして渡す。通知は届かないので、司令塔は `status.md` を読んで進み具合を確かめる。
+
+## herdr で使う（contrib/herdr）
+
+`hub.toml` に `backend = "herdr"` と `[herdr]` を書く。
+
+```sh
+herdr-reset         # ワークスペースを全部閉じて、hub.toml の通りに作り直す
+herdr-reset todo    # todo ワークスペース（[[herdr.workspace]] の label）だけを作り直す
+herdr-reset [<label>...] --handoff "<引き継ぎ文>"   # 立て直したあと、新しい司令塔へ引き継ぐ
+herdr-reset [<label>...] --resume   # 司令塔のセッションを復帰して立て直す
+```
+
+自動では実行されない。OS の再起動などで herdr がレイアウトだけを戻したときも、`herdr-reset` を手で実行する。
+
+### 引き継ぎ（herdr-reset --handoff）
+
+`herdr-reset --handoff "<引き継ぎ文>"` で、立て直したあとの司令塔へ作業を引き継げる。
+
+```sh
+herdr-reset --handoff "目的: ...
+現状: ...
+次の手順: ..."
+```
 
 ### setup（スクリプトで組み立てるワークスペース）
 
 ```toml
-[[workspace]]
+[[agent]]
+name = "todo"
+cwd = "todo"
+launched_by = "setup"
+
+[[herdr.workspace]]
 label = "todo"
 cwd = "todo"
 setup = "todo/contrib/herdr/todo-herdr"
@@ -158,14 +196,16 @@ agents = ["todo"]
 
 `herdr-reset` は既存のワークスペースを閉じてからスクリプトを実行する。そのため `setup` のワークスペースを単体でリセットすると、サイドバーの末尾へ移る。
 
-### rules と agent-settings.json
+### 旧形式の hub.toml の書き換え
 
-`herdr-reset` と `hub-work` が起動する claude に、次を渡す。agent の `args` とは併用できる（`--settings` と `--append-system-prompt-file` を `args` に書くと衝突として止まる）。
+`[[agent]]` の無い旧形式（`session` と `[[workspace]]` を直に書く形）は、次で新形式に書き換える。司令塔の名前 `hub` は `commander` になる。
 
-- `--append-system-prompt-file`: `<hub-env>/rules/*.md` を連結した生成ファイル（rules が無ければ渡さない）。`$XDG_STATE_HOME/hub/envs/<環境>-<ハッシュ>/agent-rules.md` に置く
-- `--settings`: `<hub-env>/agent-settings.json`（あれば）
+```sh
+migrate-hub-toml <hub-env>/hub.toml           # 新形式を表示する
+migrate-hub-toml <hub-env>/hub.toml --write   # hub.toml.bak を残して書き換える
+```
 
-反映されるのは、次に起動したエージェントから。`setup` のスクリプトが自分で起動するエージェントには自動では届かないので、スクリプト側で環境変数 `HUB_CLAUDE_ARGS`（シェル用に引用済み）を claude の引数に足す。
+## フック
 
 ### hub-commit-guard（git フックを飛ばす操作を拒否するフック）
 
@@ -193,8 +233,8 @@ tests/run.sh medium   # 結合テスト
 tests/run.sh          # 両方
 ```
 
-- small: `tests/test_hub_*.py`。フック（hub-guard・hub-commit-guard・hub-session-record）、backend の選択と環境の特定、偽の backend での hub-work の単体テスト。
-- medium: `tests/integration.sh`。一時ディレクトリの環境と専用の herdr サーバーで、hub のコマンドを通しで試す。実際のセッションには触らない。`HUB_TEST_GROUPS="base wtshape"` で一部のグループだけを流せる。
+- small: `tests/test_hub_*.py`。フック、backend の選択と環境の特定、hub.toml の読み込みと書き換え、偽の backend での hub-work の単体テスト。
+- medium: `tests/integration.sh`。一時ディレクトリの環境と専用の herdr サーバーで、hub のコマンドを通しで試す。実際のセッションには触らない。hub.toml の旧形式と新形式（`HUB_TEST_TOML=new`）で 2 回流す。`HUB_TEST_GROUPS="base wtshape"` で一部のグループだけを流せる。
 - large: 本物の Claude や実際のセッションでの確認。`run.sh` の対象外で、手で行う。
 
 ## ライセンス
