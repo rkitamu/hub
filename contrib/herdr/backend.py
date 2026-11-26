@@ -11,7 +11,7 @@ import time
 from pathlib import Path
 
 from hub_backend import Backend, BackendError
-from hub_config import agent_defs, is_legacy
+from hub_config import agent_defs
 from hublib import HubError
 
 
@@ -47,7 +47,7 @@ def live_agents() -> list[dict]:
 
 
 def session_of(cfg: dict) -> str | None:
-    return (cfg.get("herdr") or {}).get("session") or cfg.get("session")
+    return (cfg.get("herdr") or {}).get("session")
 
 
 def detect(env: Path, cfg: dict) -> bool:
@@ -56,13 +56,10 @@ def detect(env: Path, cfg: dict) -> bool:
 
 
 def layout(env: Path, cfg: dict) -> list[dict]:
-    """herdr のワークスペースの定義を、旧形式の形（ペインの agent が {name, kind, args} の表）で返す。
+    """[herdr] の [[herdr.workspace]] を、ペインの agent = "<name>" を [[agent]] の定義（{name, kind, args}）に置き換えて返す。
 
-    新形式では [herdr] の [[herdr.workspace]] を読み、ペインの agent = "<name>" を [[agent]] の定義に置き換える。
     ペインの cwd は、書かれていなければエージェントの cwd にする。
     """
-    if is_legacy(cfg):
-        return copy.deepcopy(cfg.get("workspace") or [])
     defs = {a["name"]: a for a in agent_defs(env, cfg)}
     wss = copy.deepcopy((cfg.get("herdr") or {}).get("workspace") or [])
     for ws in wss:

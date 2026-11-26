@@ -26,7 +26,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "lib"))
 from hub_backend import Backend, backend_for  # noqa: E402
-from hub_config import commander_name, find_agent, session_record_name  # noqa: E402
+from hub_config import COMMANDER, SESSION_RECORD, find_agent  # noqa: E402
 from hublib import HubError, agent_argv, claude_launch_args, commander_launch, env_state_dir, find_env  # noqa: E402
 
 NO_BACKEND = 3
@@ -81,7 +81,7 @@ def seen(backend: Backend, name: str, text: str) -> bool:
 def cmd_notify(a, backend: Backend, env: Path, cfg: dict) -> int:
     if backend.manual:
         return no_backend(backend)
-    name = commander_name(cfg)
+    name = COMMANDER
     deadline = time.monotonic() + env_seconds("HUB_AGENT_NOTIFY_WAIT", NOTIFY_WAIT)
     interval = env_seconds("HUB_AGENT_NOTIFY_INTERVAL", NOTIFY_INTERVAL)
     while True:
@@ -101,8 +101,8 @@ def cmd_notify(a, backend: Backend, env: Path, cfg: dict) -> int:
 
 def launch_argv(env: Path, cfg: dict, agent: dict) -> list[str]:
     launch = claude_launch_args(env)
-    if agent["name"] == commander_name(cfg) and agent["kind"] == "claude":
-        record = env_state_dir(env) / session_record_name(cfg)
+    if agent["name"] == COMMANDER and agent["kind"] == "claude":
+        record = env_state_dir(env) / SESSION_RECORD
         launch = commander_launch(env, agent, agent["path"], launch, record) or launch
     return agent_argv(agent["kind"], launch, agent["args"])
 

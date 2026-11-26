@@ -98,7 +98,7 @@ class WorkEnv(unittest.TestCase):
         self.addCleanup(patcher.stop)
         self.env = self.root / "env"
         (self.env / "hub-env").mkdir(parents=True)
-        (self.env / "hub-env/hub.toml").write_text('session = "s"\n')
+        (self.env / "hub-env/hub.toml").write_text('backend = "herdr"\n[herdr]\nsession = "s"\n')
         os.environ.update({
             "HUB_ENV": str(self.env), "XDG_STATE_HOME": str(self.root / "state"),
             "CLAUDE_CONFIG_DIR": str(self.root / "claude"),

@@ -7,7 +7,7 @@
 
 usage: hub-check
 
-ずれがあれば一覧して exit 1。エージェントは hub.toml の [[agent]]（旧形式ではペインの agent と setup の agents）と照合する。
+ずれがあれば一覧して exit 1。エージェントは hub.toml の [[agent]] と照合する。
 """
 
 from __future__ import annotations
@@ -88,9 +88,7 @@ def check(env: Path, cfg: dict, backend: Backend) -> list[str]:
             out.append(f"MAP.md: hub.toml のディレクトリ {name} が載っていません")
 
     # エージェント
-    # NOTE: 移行期間は、旧い見出し「herdr 上のエージェント」も読む。
-    rows = map_table(text, "エージェント") or map_table(text, "herdr 上のエージェント")
-    in_map = {name_of(r[0]) for r in rows if r}
+    in_map = {name_of(r[0]) for r in map_table(text, "エージェント") if r}
     in_toml = {a["name"] for a in defs}
     for name in sorted(in_map - in_toml):
         out.append(f"エージェント {name}: MAP.md にありますが hub.toml にありません")

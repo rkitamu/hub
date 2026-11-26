@@ -198,7 +198,7 @@ agents = ["todo"]
 
 ### 旧形式の hub.toml の書き換え
 
-`[[agent]]` の無い旧形式（`session` と `[[workspace]]` を直に書く形）は、次で新形式に書き換える。司令塔の名前 `hub` は `commander` になる。
+`[[agent]]` の無い旧形式（`session` と `[[workspace]]` を直に書く形）は読めないので、次で新形式に書き換える。司令塔の名前 `hub` は `commander` になる。
 
 ```sh
 migrate-hub-toml <hub-env>/hub.toml           # 新形式を表示する
@@ -234,7 +234,7 @@ tests/run.sh          # 両方
 ```
 
 - small: `tests/test_hub_*.py`。フック、backend の選択と環境の特定、hub.toml の読み込みと書き換え、偽の backend での hub-work の単体テスト。
-- medium: `tests/integration.sh`。一時ディレクトリの環境と専用の herdr サーバーで、hub のコマンドを通しで試す。実際のセッションには触らない。hub.toml の旧形式と新形式（`HUB_TEST_TOML=new`）で 2 回流す。`HUB_TEST_GROUPS="base wtshape"` で一部のグループだけを流せる。
+- medium: `tests/integration.sh`。一時ディレクトリの環境と専用の herdr サーバーで、hub のコマンドを通しで試す。実際のセッションには触らない。`HUB_TEST_GROUPS="base wtshape"` で一部のグループだけを流せる。
 - large: 本物の Claude や実際のセッションでの確認。`run.sh` の対象外で、手で行う。
 
 ## ライセンス
