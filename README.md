@@ -193,8 +193,8 @@ tests/run.sh medium   # 結合テスト
 tests/run.sh          # 両方
 ```
 
-- small: `tests/test_hub_*.py`。フック（hub-guard・hub-commit-guard・hub-session-record）の単体テスト。
-- medium: `tests/integration.sh`。一時ディレクトリの環境と専用の herdr サーバーで、hub のコマンドを通しで試す。実際のセッションには触らない。
+- small: `tests/test_hub_*.py`。フック（hub-guard・hub-commit-guard・hub-session-record）、backend の選択と環境の特定、偽の backend での hub-work の単体テスト。
+- medium: `tests/integration.sh`。一時ディレクトリの環境と専用の herdr サーバーで、hub のコマンドを通しで試す。実際のセッションには触らない。`HUB_TEST_GROUPS="base wtshape"` で一部のグループだけを流せる。
 - large: 本物の Claude や実際のセッションでの確認。`run.sh` の対象外で、手で行う。
 
 ## ライセンス

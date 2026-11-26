@@ -1,4 +1,4 @@
-"""hub のコマンドが共有する処理（herdr の呼び出し・環境の特定・作業文書の読み書き）。"""
+"""hub のコマンドが共有する処理（環境の特定・エージェントの起動引数・作業文書の読み書き）。backend の呼び出しは hub_backend にある。"""
 
 from __future__ import annotations
 
@@ -25,39 +25,6 @@ class HubError(Exception):
     pass
 
 
-class HerdrError(HubError):
-    def __init__(self, message: str, code: str | None = None):
-        super().__init__(message)
-        self.code = code
-
-
-def herdr(*args: str, check: bool = True) -> dict:
-    p = subprocess.run(["herdr", *args], capture_output=True, text=True)
-    out: dict = {}
-    # NOTE: herdr はサーバーのエラーを stderr に JSON で返す。
-    for stream in (p.stdout, p.stderr):
-        try:
-            parsed = json.loads(stream) if stream.strip() else {}
-        except json.JSONDecodeError:
-            continue
-        if isinstance(parsed, dict) and parsed:
-            out = parsed
-            break
-    if check and (p.returncode != 0 or "error" in out):
-        err = out.get("error") or {}
-        msg = err.get("message") or p.stderr.strip() or p.stdout.strip()
-        raise HerdrError(f"herdr {' '.join(args)}: {msg}", err.get("code"))
-    return out
-
-
-def workspaces() -> list[dict]:
-    return herdr("workspace", "list")["result"]["workspaces"]
-
-
-def live_agents() -> list[dict]:
-    return herdr("agent", "list")["result"]["agents"]
-
-
 # ── 環境 ───────────────────────────────────────────────────────
 
 
@@ -75,13 +42,26 @@ def read_config(env: Path) -> dict | None:
 
 
 def find_env() -> tuple[Path, dict]:
-    session = os.environ.get("HERDR_SESSION")
-    if not session:
-        raise HubError("HERDR_SESSION がありません。hub.toml の session に書いたセッションのペインで実行してください")
-    hits = [(e, c) for e in registered_envs() if (c := read_config(e)) and c.get("session") == session]
-    if len(hits) != 1:
-        raise HubError(f"session '{session}' の環境が {len(hits)} 個あります（{ENVS_FILE}）")
-    return hits[0]
+    """環境を特定する。HUB_ENV → backend の中（herdr ならセッション）→ カレントディレクトリ の順に試す。"""
+    from hub_backend import detect  # NOTE: hub_backend が HubError を import するので、循環を避けて中で読む。
+
+    if explicit := os.environ.get("HUB_ENV"):
+        env = Path(explicit).expanduser().resolve()
+        if (cfg := read_config(env)) is None:
+            raise HubError(f"HUB_ENV の環境の hub.toml を読めません: {env / 'hub-env/hub.toml'}")
+        return env, cfg
+    envs = [(e, c) for e in registered_envs() if (c := read_config(e)) is not None]
+    hits = [(e, c) for e, c in envs if detect(e, c)]
+    if len(hits) > 1:
+        raise HubError(f"このセッションの環境が {len(hits)} 個あります（{ENVS_FILE}）")
+    if hits:
+        return hits[0]
+    cwd = Path.cwd().resolve()
+    hits = [(e, c) for e, c in envs if cwd == e.resolve() or e.resolve() in cwd.parents]
+    if len(hits) == 1:
+        return hits[0]
+    raise HubError(f"環境を特定できません（{ENVS_FILE}）。hub.toml の session に書いたセッションのペインか環境の中で実行するか、"
+                   "HUB_ENV に環境のパスを指定してください")
 
 
 def work_dir(env: Path) -> Path:
