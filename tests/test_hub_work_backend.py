@@ -224,8 +224,112 @@ class HubWorkTest(WorkEnv):
         self.assertEqual((label, wt["source"]), ("w-fin", {"id": "x", "label": "auto"}))
         # backend が checkout を消さなくても、core が消す
         self.assertFalse((self.env / ".hub-worktrees/fin").exists())
-        self.assertEqual(self.git("rev-parse", "--verify", "-q", "refs/heads/work/fin").returncode, 0)
+        # 自分のコミットが無いブランチは main に含まれるので消える
+        self.assertFalse(self.has_branch("work/fin"))
         self.assertEqual(self.meta("fin", archived=True)["state"], "done")
+
+    # ── finish: 作業ブランチの片付け ──
+
+    def has_branch(self, branch, cwd=None):
+        return subprocess.run(["git", "-C", str(cwd or self.app), "rev-parse", "--verify", "-q", f"refs/heads/{branch}"],
+                              capture_output=True).returncode == 0
+
+    def start_with_commit(self, name):
+        self.run_cmd("start", name, "--repo", "app", "--worktree")
+        tree = self.env / f".hub-worktrees/{name}/app"
+        self.git("commit", "-q", "--allow-empty", "-m", f"{name} の変更", cwd=tree)
+        return tree
+
+    def add_origin(self):
+        origin = self.root / "origin.git"
+        subprocess.run(["git", "clone", "-q", "--bare", str(self.app), str(origin)], check=True)
+        self.git("remote", "add", "origin", str(origin))
+        self.git("fetch", "-q", "origin")
+        self.git("remote", "set-head", "origin", "main")
+        return origin
+
+    def test_finish_keeps_unmerged_branch_without_remote(self):
+        self.start_with_commit("unm")
+        rc, out, err = self.run_cmd("finish", "unm")
+        self.assertEqual(rc, 0, err)
+        self.assertTrue(self.has_branch("work/unm"))
+        self.assertIn("main にマージされていないので残しています", out)
+
+    def test_finish_deletes_branch_merged_into_local_main(self):
+        self.start_with_commit("lm")
+        self.git("merge", "-q", "--no-ff", "-m", "merge", "work/lm")
+        rc, out, err = self.run_cmd("finish", "lm")
+        self.assertEqual(rc, 0, err)
+        self.assertFalse(self.has_branch("work/lm"))
+        self.assertIn("ブランチ work/lm を消しました（main にマージ済み）", out)
+
+    def test_finish_deletes_branch_merged_into_origin_even_if_local_main_is_old(self):
+        origin = self.add_origin()
+        tree = self.start_with_commit("om")
+        self.git("push", "-q", "-u", "origin", "work/om", cwd=tree)
+        # GitHub で PR をマージし、リモートのブランチが自動で消えた状態を作る
+        self.git("push", "-q", "origin", "work/om:main", cwd=tree)
+        self.git("branch", "-q", "-D", "work/om", cwd=origin)
+        rc, out, err = self.run_cmd("finish", "om")
+        self.assertEqual(rc, 0, err)
+        self.assertFalse(self.has_branch("work/om"))
+        self.assertIn("origin/main にマージ済み", out)
+        # 古いリモート参照は prune される。ローカルの main は動かさない
+        self.assertNotEqual(subprocess.run(["git", "-C", str(self.app), "rev-parse", "--verify", "-q",
+                                            "refs/remotes/origin/work/om"], capture_output=True).returncode, 0)
+        self.assertEqual(self.git("rev-list", "--count", "main").stdout.strip(), "1")
+
+    def test_finish_does_not_touch_remote_branch(self):
+        origin = self.add_origin()
+        tree = self.start_with_commit("rb")
+        self.git("push", "-q", "-u", "origin", "work/rb", cwd=tree)
+        self.git("push", "-q", "origin", "work/rb:main", cwd=tree)
+        rc, _, err = self.run_cmd("finish", "rb")
+        self.assertEqual(rc, 0, err)
+        self.assertFalse(self.has_branch("work/rb"))
+        self.assertTrue(self.has_branch("work/rb", cwd=origin))
+
+    def test_finish_keeps_branch_merged_only_locally_when_origin_exists(self):
+        self.add_origin()
+        self.start_with_commit("ol")
+        self.git("merge", "-q", "--no-ff", "-m", "merge", "work/ol")
+        rc, out, err = self.run_cmd("finish", "ol")
+        self.assertEqual(rc, 0, err)
+        self.assertTrue(self.has_branch("work/ol"))
+        self.assertIn("origin/main にマージされていないので残しています", out)
+
+    def test_finish_keeps_branch_when_fetch_fails(self):
+        origin = self.add_origin()
+        self.run_cmd("start", "ff", "--repo", "app", "--worktree")
+        origin.rename(origin.with_name("gone.git"))
+        rc, out, err = self.run_cmd("finish", "ff")
+        self.assertEqual(rc, 0, err)
+        self.assertTrue(self.has_branch("work/ff"))
+        self.assertIn("判定できないので残しています: origin を fetch できませんでした", out)
+        self.assertEqual(self.meta("ff", archived=True)["state"], "done")
+
+    def test_finish_reports_squash_merged_pr_and_keeps_branch(self):
+        self.start_with_commit("sq")
+        self.hw.merged_pr = lambda repo, branch: "42"
+        rc, out, err = self.run_cmd("finish", "sq")
+        self.assertEqual(rc, 0, err)
+        self.assertTrue(self.has_branch("work/sq"))
+        self.assertIn("PR #42 がマージ済みですが", out)
+
+    def test_finish_restores_upstream_when_delete_fails(self):
+        self.start_with_commit("up")
+        self.git("merge", "-q", "--no-ff", "-m", "merge", "work/up")
+        self.git("config", "branch.work/up.remote", "elsewhere")
+        self.git("config", "branch.work/up.merge", "refs/heads/x")
+        real = self.hw.git
+        self.hw.git = lambda cwd, *args, check=True: (subprocess.CompletedProcess(args, 1, "", "拒否-固有")
+                                                       if args[:2] == ("branch", "-d") else real(cwd, *args, check=check))
+        rc, out, err = self.run_cmd("finish", "up")
+        self.assertEqual(rc, 0, err)
+        self.assertTrue(self.has_branch("work/up"))
+        self.assertIn("拒否-固有", out)
+        self.assertEqual(self.git("config", "branch.work/up.remote").stdout.strip(), "elsewhere")
+        self.assertEqual(self.git("config", "branch.work/up.merge").stdout.strip(), "refs/heads/x")
 
     def test_finish_stops_on_dirty_before_closing(self):
         self.run_cmd("start", "dirty", "--repo", "app", "--worktree")

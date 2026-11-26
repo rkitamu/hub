@@ -332,9 +332,12 @@ t "止めたときワークスペースは残る" has_ws w-tree
 t "止めたときエージェントは残る" has_agent w-tree
 t "止めたとき archive へ移さない" test ! -e "$W/archive/tree"
 rm "$E/.hub-worktrees/tree/app/dirty"
-t "tree を finish できる" hub-work finish tree
+prep git -C "$E/.hub-worktrees/tree/app" commit -q --allow-empty -m 未マージの変更
+hub-work finish tree >"$T/finish-tree" 2>&1; rc=$?
+t "tree を finish できる" test "$rc" -eq 0
 t "worktree が消える" test ! -e "$E/.hub-worktrees/tree"
-t "ブランチは残る" git -C "$E/app" rev-parse --verify -q refs/heads/work/tree
+t "マージされていないブランチは残る" git -C "$E/app" rev-parse --verify -q refs/heads/work/tree
+t "残した理由を表示する" grep -q 'work/tree は main にマージされていないので残しています' "$T/finish-tree"
 t "archive へ移る" test -f "$W/archive/tree/status.md"
 t "archive の state は done" grep -qx 'state: done' "$W/archive/tree/status.md"
 t "他の作業は残る" has_agent w-plain
@@ -351,7 +354,12 @@ t "通常の作業を立て直す" hub-work resume plain
 t "通常の作業のエージェントが戻る" has_agent w-plain
 t "resume は冪等" hub-work resume again
 t "二重に作らない" count_ws w-again 1
-t "again を finish できる" hub-work finish again
+prep git -C "$E/.hub-worktrees/again/app" commit -q --allow-empty -m マージする変更
+prep git -C "$E/app" merge -q --no-ff -m merge work/again
+hub-work finish again >"$T/finish-again" 2>&1; rc=$?
+t "again を finish できる" test "$rc" -eq 0
+tn "main にマージ済みのブランチは消える" git -C "$E/app" rev-parse --verify -q refs/heads/work/again
+t "消したことを表示する" grep -q 'work/again を消しました' "$T/finish-again"
 hub-work finish plain >"$T/finish-plain" 2>&1; rc=$?
 t "plain を finish できる" test "$rc" -eq 0
 t "finish が棚卸しを促す" grep -q '棚卸し' "$T/finish-plain"
