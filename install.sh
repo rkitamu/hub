@@ -67,7 +67,7 @@ sed -e "s|{{ENV_NAME}}|$(basename "$env_dir")|g" "$HUB/templates/README.md" | cr
 create MAP.md <"$HUB/templates/MAP.md"
 create hub.toml <"$HUB/templates/hub.toml"
 create .claude/skills/delegate/SKILL.md <"$HUB/templates/skills/delegate/SKILL.md"
-# herdr-reset と hub-work が起動するエージェントに --settings で渡す
+# hub-work・hub-agent launch・herdr-reset が起動するエージェントに --settings で渡す
 sed -e "s|{{HUB_ENV}}|$HUB_ENV|g" -e "s|{{HUB}}|$HUB|g" "$HUB/templates/agent-settings.json" | create agent-settings.json
 # 作業文書（work/）は hub-env の git に入れない。手元専用の別リポジトリにする
 printf '/work/\n' | create .gitignore

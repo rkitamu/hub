@@ -37,6 +37,4 @@ description: 作業をエージェントに任せる段取り。「#30 を任せ
 ## 作業エージェントの報告の決まり
 
 1. 先に status.md の本文（進捗・結果）へ書く。止まったら front matter の `state` を `blocked` にする。
-2. そのあと `herdr agent prompt hub "<作業名と要約>"` で通知する。
-3. `agent_blocked` などで拒否されたら、少し待って再送する。
-4. `timeout` は届いた可能性があるので、`herdr agent read hub --source recent-unwrapped --lines 40` で確かめてから再送する。
+2. そのあと `hub-agent notify "<作業名と要約>"` で通知する。確認待ちの送り直しと timeout の確認はコマンドがする。backend が無いと表示されたら、通知は要らない（司令塔が status.md を読む）。

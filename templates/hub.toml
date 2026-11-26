@@ -1,78 +1,105 @@
-# 環境の herdr の構成。herdr-reset はこの通りに herdr を組み立てる。
-# パスはすべて環境（hub-env の親ディレクトリ）からの相対パスで書く。
+# 環境の構成。パスはすべて環境（hub-env の親ディレクトリ）からの相対パスで書く。
 
-# 環境を置く herdr のセッション名。herdr-reset はこのセッションのペインで実行する。
-session = "hub"
+# エージェントを置いて動かす仕組み。
+#   "herdr"  下の [herdr] の通りに herdr-reset が組み立て、hub-work が herdr にエージェントを起動させる
+#   "none"   エージェントを起動しない。hub-work は worktree と status.md を作り、起動コマンドを示す
+#            （hub-agent launch <name> で、[[agent]] の通りに今の端末で起動できる）。[herdr] は要らない
+backend = "herdr"
 
 # hub-status が期限を読む TODO のファイル。既定は todo/data/active.md。
 # todo_file = "todo/data/active.md"
 
-# ── ワークスペース ──────────────────────────────────────────────
-# [[workspace]] を書いた順に、herdr のサイドバーへ並ぶ。
+# ── エージェント（backend によらない） ──────────────────────────
+# [[agent]] にエージェントを 1 人ずつ書く。hub-check はこれを MAP.md と照合する。
+#   name         エージェントの名前。環境の中で一意。commander は司令塔の名前で、cwd は hub-env にする
+#   cwd          エージェントを起動するディレクトリ
+#   args         claude の引数（省略可）。rules と agent-settings.json の引数は hub が足す
+#   kind         claude 以外のエージェントのとき（省略すると claude）
+#   launched_by  "setup" なら、[herdr] の setup スクリプトが起動する（hub は照合にだけ使う）
+
+[[agent]]
+name = "commander"
+cwd = "hub-env"
+
+# ── herdr のレイアウト（backend = "herdr" のとき。herdr-reset が読む） ──
+[herdr]
+# 環境を置く herdr のセッション名。herdr-reset と hub-work はこのセッションのペインで実行する。
+session = "hub"
+
+# [[herdr.workspace]] を書いた順に、herdr のサイドバーへ並ぶ。
 #   label  ワークスペースの名前。herdr-reset <label> で、そのワークスペースだけを作り直せる
 #   cwd    ワークスペースのディレクトリ。ペインは、ペインの cwd を書かなければここで開く
 #   setup  タブとペインの定義の代わりに、このスクリプトで組み立てる（環境からの相対パス。tab とは同時に書けない）
 #          スクリプトは cwd で実行され、label と同じ名前のワークスペースを作る。環境変数 HUB_ENV_DIR・HUB_WORKSPACE_LABEL が渡る
 #          herdr-reset は、既存のワークスペースを閉じてから実行する
 #          スクリプトが起動するエージェントに rules を渡すには、環境変数 HUB_CLAUDE_ARGS（シェル用に引用済み）を claude の引数に足す
-#   agents setup が起動するエージェントの名前の一覧（省略可）。hub-check の照合に使う
+#   agents setup が起動するエージェントの名前の一覧（省略可）。[[agent]] に launched_by = "setup" で書いたもの
 #
-# [[workspace.tab]] を書いた順に、タブが並ぶ。
+# [[herdr.workspace.tab]] を書いた順に、タブが並ぶ。
 #   label  タブの名前
 #
-# [[workspace.tab.pane]] を書いた順に、ペインを作る。1 つ目はタブを作ったときからあるペイン。
+# [[herdr.workspace.tab.pane]] を書いた順に、ペインを作る。1 つ目はタブを作ったときからあるペイン。
 #   name   ペインの名前。後のペインの split.from で参照する
 #   split  2 つ目以降のペインの作り方。{ from = "<分割元の name>", direction = "right" | "down", ratio = <分割元に残す割合> }
-#   cwd    ペインを開くディレクトリ（省略可）。省略するとワークスペースの cwd。1 つ目のペインにも効く
+#   cwd    ペインを開くディレクトリ（省略可）。省略するとワークスペースの cwd（agent のペインはエージェントの cwd）
 #   run    ペインで実行するコマンド。ペインの cwd で実行される
-#   agent  ペインで起動するエージェント。{ name = "<herdr 上の名前>", args = [<claude の引数>] }
-#          name は herdr のセッションの中で一意
+#   agent  ペインで起動するエージェント。[[agent]] の name を書く
 
 # hub-env は司令塔のワークスペース。どの環境でもこのまま使える。
-[[workspace]]
+[[herdr.workspace]]
 label = "hub-env"
 cwd = "hub-env"
 
-[[workspace.tab]]
+[[herdr.workspace.tab]]
 label = "Claude"
 
-[[workspace.tab.pane]]
+[[herdr.workspace.tab.pane]]
 name = "claude"
-agent = { name = "hub" }
+agent = "commander"
 
-[[workspace.tab]]
+[[herdr.workspace.tab]]
 label = "Shell"
 
 # ── 例: 子リポジトリのワークスペース ─────────────────────────────
 # 以下は、作者の手元の todo リポジトリ（scripts/todo-view などを持つ）を前提にした例。
 # このままでは動かないので、自分の子リポジトリに合わせて書き換え、コメントを外して使う。
-# 子リポジトリごとに [[workspace]] を 1 つ足す。要らなければ消してよい。
+# TOML では表の後に別の表のキーを書けないので、[[agent]] は上のエージェントの節へ移して書く。
 #
-# todo リポジトリの組み立てスクリプトを使うなら、次の 4 行だけでよい（下のタブ定義は要らない）。
-# [[workspace]]
+# todo リポジトリの組み立てスクリプトを使うなら、次のように書く（タブの定義は要らない）。
+# [[agent]]
+# name = "todo"
+# cwd = "todo"
+# launched_by = "setup"
+#
+# [[herdr.workspace]]
 # label = "todo"
 # cwd = "todo"
 # setup = "todo/contrib/herdr/todo-herdr"
 # agents = ["todo"]
 #
 # スクリプトを使わず、ペインを定義するなら次のように書く。
-# [[workspace]]
+# [[agent]]
+# name = "todo"
+# cwd = "todo"
+# args = ["--agent", "todo"]
+#
+# [[herdr.workspace]]
 # label = "todo"
 # cwd = "todo"
 #
-# [[workspace.tab]]
+# [[herdr.workspace.tab]]
 # label = "ToDo"
 #
-# [[workspace.tab.pane]]
+# [[herdr.workspace.tab.pane]]
 # name = "view"
 # run = "scripts/todo-view data/active.md"
 #
-# [[workspace.tab.pane]]
+# [[herdr.workspace.tab.pane]]
 # name = "claude"
 # split = { from = "view", direction = "right", ratio = 0.55 }
-# agent = { name = "todo", args = ["--agent", "todo"] }
+# agent = "todo"
 #
-# [[workspace.tab.pane]]
+# [[herdr.workspace.tab.pane]]
 # name = "notes"
 # split = { from = "view", direction = "down", ratio = 0.43 }
 # cwd = "todo/data/notes"
